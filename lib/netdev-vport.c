@@ -595,6 +595,9 @@ parse_tunnel_config(const char *name, const char *type,
     ovs_be32 daddr = htonl(0);
     ovs_be32 saddr = htonl(0);
     uint32_t flags;
+    ovs_be32 vtep = 0;
+    ovs_be32 vxlan_mcast_ip = 0;
+    uint32_t vni = 0;
 
     supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
     is_ipsec = !strncmp(type, "ipsec_", 6);
@@ -690,6 +693,33 @@ parse_tunnel_config(const char *name, const char *type,
                    !strcmp(node->key, "in_key") ||
                    !strcmp(node->key, "out_key")) {
             /* Handled separately below. */
+        } else if (strcmp(node->key, "vtep") == 0) {
+            struct in_addr in_addr;
+            if (lookup_ip(node->value, &in_addr)) {
+                VLOG_WARN("%s: bad %s 'ip'", node->key, type);
+            } else
+                vtep = in_addr.s_addr;
+        } else if (strcmp(node->key, "vni") == 0) {
+            vni = atoi(node->value);
+        } else if (strcmp(node->key, "vxlan_udp_port") == 0) {
+            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_VTEP_PORT,
+                           atoi(node->value));
+        } else if (strcmp(node->key, "vxlan_mcast_ip") == 0) {
+            struct in_addr in_addr;
+            if (lookup_ip(node->value, &in_addr)) {
+                VLOG_WARN("%s: bad %s 'ip'", node->key, node->value);
+            } else {
+                if (ip_is_multicast(in_addr.s_addr)) {
+                    vxlan_mcast_ip = in_addr.s_addr;
+                }
+                else {
+                    VLOG_WARN("%s: bad %s 'multicast ip'",
+                              node->key, node->value);
+                }
+            }
+        } else if (strcmp(node->key, "vxlan_mcast_port") == 0) {
+            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_MCAST_PORT,
+                           atoi(node->value));
         } else {
             VLOG_WARN("%s: unknown %s argument '%s'", name, type, node->key);
         }
@@ -722,21 +752,39 @@ parse_tunnel_config(const char *name, const char *type,
         }
     }
 
-    set_key(args, "in_key", OVS_TUNNEL_ATTR_IN_KEY, options);
-    set_key(args, "out_key", OVS_TUNNEL_ATTR_OUT_KEY, options);
-
-    if (!daddr) {
-        VLOG_ERR("%s: %s type requires valid 'remote_ip' argument",
-                 name, type);
-        return EINVAL;
+    if (strcmp (type, "vxlan") == 0) {
+        if (vtep != 0 && vni != 0 && vxlan_mcast_ip != 0) {
+            nl_msg_put_u32(options, OVS_TUNNEL_ATTR_VNI, vni);
+            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_VTEP, vtep);
+            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_MCAST_IP, vxlan_mcast_ip);
+        }
+        else {
+            VLOG_ERR("Configure options, VNI, VTEP, VXLAN MULTICAST IP. "
+                     "MISSING: %s %s %s",
+                     (vni != 0) ? "VNI " : " ",
+                     (vtep != 0) ? "VTEP " : " ",
+                     (vxlan_mcast_ip != 0) ? "VXLAN MULTICAST IP" : " ");
+            return EINVAL;
+        }
     }
-    nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, daddr);
+    else {
+        set_key(args, "in_key", OVS_TUNNEL_ATTR_IN_KEY, options);
+        set_key(args, "out_key", OVS_TUNNEL_ATTR_OUT_KEY, options);
 
-    if (saddr) {
-        if (ip_is_multicast(daddr)) {
-            VLOG_WARN("%s: remote_ip is multicast, ignoring local_ip", name);
-        } else {
-            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, saddr);
+        if (!daddr) {
+            VLOG_ERR("%s: %s type requires valid 'remote_ip' argument",
+                     name, type);
+            return EINVAL;
+        }
+        nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, daddr);
+        
+        if (saddr) {
+            if (ip_is_multicast(daddr)) {
+                VLOG_WARN("%s: remote_ip is multicast, ignoring local_ip",
+                          name);
+            } else {
+                nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, saddr);
+            }
         }
     }
 
