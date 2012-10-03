@@ -597,7 +597,7 @@ parse_tunnel_config(const char *name, const char *type,
     uint32_t flags;
     ovs_be32 vtep = 0;
     ovs_be32 vxlan_mcast_ip = 0;
-    uint32_t vni = 0;
+    uint64_t vni = 0;
 
     supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
     is_ipsec = !strncmp(type, "ipsec_", 6);
@@ -700,7 +700,12 @@ parse_tunnel_config(const char *name, const char *type,
             } else
                 vtep = in_addr.s_addr;
         } else if (strcmp(node->key, "vni") == 0) {
-            vni = atoi(node->value);
+            vni = strtoull(node->value, NULL, 0);
+            if (vni > 0xFFFFFF) {
+                VLOG_WARN("bad VNI. Can't be more than "
+                          "16777215(0xFFFFFF). %llu", (uint64_t)vni);
+                return EINVAL;
+            } 
         } else if (strcmp(node->key, "vxlan_udp_port") == 0) {
             nl_msg_put_u16(options, OVS_TUNNEL_ATTR_VTEP_PORT,
                            atoi(node->value));
@@ -754,9 +759,14 @@ parse_tunnel_config(const char *name, const char *type,
 
     if (strcmp (type, "vxlan") == 0) {
         if (vtep != 0 && vni != 0 && vxlan_mcast_ip != 0) {
-            nl_msg_put_u32(options, OVS_TUNNEL_ATTR_VNI, vni);
-            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_VTEP, vtep);
-            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_MCAST_IP, vxlan_mcast_ip);
+            __be64  nvni = htonll(vni);
+            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, vtep);
+            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, vxlan_mcast_ip);
+
+            nl_msg_put_be64(options, OVS_TUNNEL_ATTR_IN_KEY, nvni);
+            nl_msg_put_be64(options, OVS_TUNNEL_ATTR_OUT_KEY, nvni);
+            VLOG_ERR("VNI: 0x%llx, VTEP: 0x%x, mcast_ip: 0x%x",
+                     nvni, vtep, vxlan_mcast_ip);
         }
         else {
             VLOG_ERR("Configure options, VNI, VTEP, VXLAN MULTICAST IP. "
@@ -805,6 +815,8 @@ tnl_port_config_from_nlattr(const struct nlattr *options, size_t options_len,
         [OVS_TUNNEL_ATTR_OUT_KEY] = { .type = NL_A_BE64, .optional = true },
         [OVS_TUNNEL_ATTR_TOS] = { .type = NL_A_U8, .optional = true },
         [OVS_TUNNEL_ATTR_TTL] = { .type = NL_A_U8, .optional = true },
+        [OVS_TUNNEL_ATTR_VTEP_PORT] = { .type = NL_A_U16, .optional=true },
+        [OVS_TUNNEL_ATTR_MCAST_PORT] = { .type = NL_A_U16, .optional=true },
     };
     struct ofpbuf buf;
 

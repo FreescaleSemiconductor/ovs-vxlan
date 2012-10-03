@@ -45,14 +45,8 @@
 
 /* OVS_VPORT_ATTR_OPTIONS attributes for tunnels.
  *
- * OVS_TUNNEL_ATTR_FLAGS and OVS_TUNNEL_ATTR_DST_IPV4 are required.  All other
- * attributes are optional.
- *
- * Set of new attributes for VXLAN. Technically speaking few attributes such
- * as VNI, VTEP does not need to be new attributes. OVS_TUNNEL_ATTR_SRC_IPV4
- * can be used for VTEP and OVS_TUNNEL_ATTR_IN_KEY can be used for VNI. In
- * the interest of code reading experience and code clartiy, these new
- * flags are defined.
+ * OVS_TUNNEL_ATTR_FLAGS and OVS_TUNNEL_ATTR_DST_IPV4 (except for VXLAN)
+ * are required.  All other attributes are optional.
  */
 enum {
 	OVS_TUNNEL_ATTR_UNSPEC,
@@ -64,10 +58,10 @@ enum {
 	OVS_TUNNEL_ATTR_TOS,        /* 8-bit TOS value. */
 	OVS_TUNNEL_ATTR_TTL,        /* 8-bit TTL value. */
 
-	OVS_TUNNEL_ATTR_VTEP,       /* IPv4 VXLAN source address. */
+	//OVS_TUNNEL_ATTR_VTEP,       /* IPv4 VXLAN source address. */
 	OVS_TUNNEL_ATTR_VTEP_PORT,  /* VTEP UDP port to bind on. */
-    OVS_TUNNEL_ATTR_VNI,        /* VXLAN segment id */
-    OVS_TUNNEL_ATTR_MCAST_IP,   /* Mulitcast IP for broadcast messages */
+    //OVS_TUNNEL_ATTR_VNI,        /* VXLAN segment id */
+    //OVS_TUNNEL_ATTR_MCAST_IP,   /* Mulitcast IP for broadcast messages */
     OVS_TUNNEL_ATTR_MCAST_PORT, /* Mulitcast UDP port for broadcast messages */
 
 	__OVS_TUNNEL_ATTR_MAX

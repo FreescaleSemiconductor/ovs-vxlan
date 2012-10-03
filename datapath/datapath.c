@@ -59,6 +59,7 @@
 #include "vlan.h"
 #include "tunnel.h"
 #include "vport-internal_dev.h"
+#include "vport-vxlan.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,18) || \
     LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
@@ -2205,9 +2206,13 @@ static int __init dp_init(void)
 	if (err)
 		goto error_wq;
 
+    err = ovs_vxlan_init();
+    if (err)
+        goto error_tnl_exit;
+
 	err = ovs_flow_init();
 	if (err)
-		goto error_tnl_exit;
+		goto error_vxlan_exit;
 
 	err = ovs_vport_init();
 	if (err)
@@ -2237,6 +2242,8 @@ error_vport_exit:
 	ovs_vport_exit();
 error_flow_exit:
 	ovs_flow_exit();
+ error_vxlan_exit:
+    ovs_vxlan_exit();
 error_tnl_exit:
 	ovs_tnl_exit();
 error_wq:
@@ -2256,6 +2263,7 @@ static void dp_cleanup(void)
 	rcu_barrier();
 	ovs_vport_exit();
 	ovs_flow_exit();
+    ovs_vxlan_exit();
 	ovs_tnl_exit();
 	ovs_workqueues_exit();
 	genl_exec_exit();

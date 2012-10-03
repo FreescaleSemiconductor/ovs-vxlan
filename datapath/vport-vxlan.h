@@ -24,7 +24,8 @@
 #include "vport.h"
 #include "vport-generic.h"
 
-#define VXLAN_DST_PORT 4341
+#define VXLAN_UDP_PORT 4341
+#define VXLAN_MCAST_PORT 4341
 #define VXLAN_IPSEC_SRC_PORT 4564
 
 #define VXLAN_FLAGS 0x08000000	/* struct vxlanhdr.vx_flags required value. */
@@ -39,29 +40,48 @@ struct vxlanhdr {
 	__be32 vx_vni;
 };
 
-static inline struct vxlanhdr *vxlan_hdr(const struct sk_buff *skb)
-{
-	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
-}
+struct vxlan_mutable_config {
+	struct rcu_head   rcu;
+    __be64            vni;
+    __be32            vtep;
+    __be32            mcast_ip;
+	u32	              flags;
+    u16               vtep_port;
+    u16               mcast_port;
+	u8                eth_addr[ETH_ALEN];
+	u8	              tos;
+	u8	              ttl;
+	u32                seq;
 
-#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+};
 
-static inline int vxlan_hdr_len(const struct tnl_mutable_config *mutable)
-{
-	return VXLAN_HLEN;
-}
+struct vxlan_vport {
+	struct rcu_head rcu;
+	struct hlist_node hash_node;
 
-static inline void vxlan_tunnel_build_header(void *header, __be64 tun_id)
-{
-	struct udphdr *udph = header;
-	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
+	char name[IFNAMSIZ];
 
-	udph->dest = htons(VXLAN_DST_PORT);
-	udph->check = 0;
+	struct vxlan_mutable_config __rcu *mutable;
 
-	vxh->vx_flags = htonl(VXLAN_FLAGS);
-	vxh->vx_vni = htonl(be64_to_cpu(tun_id) << 8);
-}
+	spinlock_t cache_lock;
+	struct tnl_cache __rcu *cache;	/* Protected by RCU/cache_lock. */
 
+#ifdef NEED_CACHE_TIMEOUT
+	/*
+	 * If we must rely on expiration time to invalidate the cache, this is
+	 * the interval.  It is randomized within a range (defined by
+	 * MAX_CACHE_EXP in tunnel.c) to avoid synchronized expirations caused
+	 * by creation of a large number of tunnels at a one time.
+	 */
+	unsigned long cache_exp_interval;
+#endif
+
+    struct net          *net;
+    struct socket __rcu *rcv_socket;  /* VTEP receive socket */
+    struct socket __rcu *mcast_socket; /* MULTICAST receive/send socket */
+};
+
+int ovs_vxlan_init (void);
+void ovs_vxlan_exit (void);
 #endif /* VPORT_VXLAN_H */
 
