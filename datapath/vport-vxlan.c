@@ -29,8 +29,11 @@
 #include "vport-generic.h"
 #include "vport-vxlan.h"
 
-#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
 #define UDP_ENCAP_VXLAN (10)
+#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+#define VXPORT_TABLE_SIZE  (1024)
+#define VXLAN_MAC_TABLE_SIZE  (1024)
+
 
 static struct vport *vxlan_create(const struct vport_parms *parms);
 static void vxlan_destroy(struct vport *vport);
@@ -42,6 +45,7 @@ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb);
 static int vxlan_send(struct vport *vport, struct sk_buff *skb);
 static int vxlan_rcv(struct sock *sk, struct sk_buff *skb);
 static int vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb);
+static void vxlan_mac_table_entry_learn (struct vxlan_vport *vxport, struct iphdr *iph, struct sk_buff *skb);
 
 const struct vport_ops ovs_vxlan_vport_ops = {
 	.type		      = OVS_VPORT_TYPE_VXLAN,
@@ -59,26 +63,8 @@ const struct vport_ops ovs_vxlan_vport_ops = {
 	.send             = vxlan_send,
 };
 
-static inline struct
-vxlanhdr *vxlan_hdr(const struct sk_buff *skb)
-{
-	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
-}
 
-#if 0
-static inline void
-vxlan_tunnel_build_header(void *header, __be64 tun_id)
-{
-	struct udphdr *udph = header;
-	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
-
-	udph->dest = htons(VXLAN_DST_PORT);
-	udph->check = 0;
-
-	vxh->vx_flags = htonl(VXLAN_FLAGS);
-	vxh->vx_vni = htonl(be64_to_cpu(tun_id) << 8);
-}
-#endif
+static struct hlist_head *vxport_table __read_mostly;
 
 
 static inline struct vxlan_vport *
@@ -94,7 +80,116 @@ vxlan_rcu_mutble_free_cb(struct rcu_head *rcu)
 	struct vxlan_mutable_config *c;
 
     c = container_of(rcu, struct vxlan_mutable_config, rcu);
+
 	kfree(c);
+}
+
+static struct hlist_head *
+vxlan_get_vxport_table_bucket (u32 vni)
+{
+    u32 hash;
+    struct hlist_head *h;
+        
+    hash = jhash2(&vni, 1, 0);
+    h = &vxport_table [(hash & (VXPORT_TABLE_SIZE - 1))];
+
+    return h;
+}
+
+static int
+vxlan_add_vxport (u32 vni, struct vxlan_vport *vxport)
+{
+    struct hlist_head *h;
+
+    h = vxlan_get_vxport_table_bucket (vni);
+    hlist_add_head_rcu (&vxport->hash_node, h);
+
+    return 0;
+}
+
+static void
+vxlan_del_vxport (struct vxlan_vport *vxport)
+{
+    hlist_del_init_rcu (&vxport->hash_node);
+}
+
+
+static void
+vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
+{
+	struct vxlan_mac_entry *vme;
+
+    vme = container_of(rcu, struct vxlan_mac_entry, rcu);
+
+	kfree(vme);
+}
+
+static int
+vxlan_vme_add (struct vxlan_vport *vxport, __be32 peer_vtep, 
+                u8 *macaddr, u32 flags)
+{
+    struct vxlan_mac_entry *vme;
+    struct hlist_head      *bucket, *mac_table;
+    u32                     hash;
+
+    vme = kzalloc (sizeof (struct vxlan_mac_entry), GFP_KERNEL);
+    if (vme == NULL)
+        return -ENOMEM;
+
+    vme->peer = peer_vtep;
+    memcpy (vme->macaddr, macaddr, ETH_ALEN);
+    vme->flags = flags;
+
+    hash = jhash (macaddr, ETH_ALEN, 0);
+    mac_table = rcu_dereference_rtnl(vxport->mac_table);
+    bucket = &mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
+    hlist_add_head_rcu (&vme->hash_node, bucket);
+
+    return 0;
+}
+
+static __be32
+vxlan_vme_get_peer_vtep (struct vxlan_vport *vxport, u8 *macaddr)
+{
+    struct vxlan_mac_entry *vme;
+    struct hlist_head      *bucket, *mac_table;
+    struct hlist_node      *node;
+    u32                     hash;
+
+    hash = jhash (macaddr, ETH_ALEN, 0);
+    mac_table = rcu_dereference_rtnl(vxport->mac_table);
+    bucket = &mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
+
+	hlist_for_each_entry_rcu(vme, node, bucket, hash_node) {
+        if (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0) {
+            return vme->peer;
+        }
+    }
+
+    return 0;
+}
+
+
+static struct vxlan_vport *
+vxlan_get_vxport (u32 vni)
+{
+    struct hlist_node  *node;
+    struct hlist_head  *bucket;
+    struct vxlan_vport *vxport;
+
+    bucket = vxlan_get_vxport_table_bucket (vni);
+
+	hlist_for_each_entry_rcu(vxport, node, bucket, hash_node) {
+		struct vxlan_mutable_config *mutable;
+
+        /* This whole business of rcu_*_rtnl is sickening */
+		mutable = rcu_dereference_rtnl(vxport->mutable);
+        if (mutable->vni == vni) {
+            return vxport;
+        }
+	}
+
+    return NULL;
 }
 
 static int
@@ -190,10 +285,11 @@ vxlan_close_socket (struct socket *socket)
 static struct vport *
 vxlan_create(const struct vport_parms *parms)
 {
-	struct vport *vport;
-	struct vxlan_vport *vxport;
-	struct vxlan_mutable_config *mutable;
-	int initial_frag_id, err;
+	struct vport                   *vport;
+	struct vxlan_vport             *vxport;
+	struct vxlan_mutable_config    *mutable;
+    struct hlist_head              *mac_table;
+	int                            initial_frag_id, err, i;
 
 	vport = ovs_vport_alloc(sizeof(struct vxlan_vport),
                             &ovs_vxlan_vport_ops, parms);
@@ -202,12 +298,22 @@ vxlan_create(const struct vport_parms *parms)
 		goto error;
 	}
 
+	mac_table = kmalloc(VXLAN_MAC_TABLE_SIZE * sizeof(struct hlist_head*),
+            GFP_KERNEL);
+	if (mac_table == NULL) {
+		err = -ENOMEM;
+		goto error_free_vport;
+    }
+
+	for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++)
+		INIT_HLIST_HEAD(&mac_table[i]);
+
 	vxport = vxlan_vport_priv(vport);
 	strcpy(vxport->name, parms->name);
 	mutable = kzalloc(sizeof(struct vxlan_mutable_config), GFP_KERNEL);
 	if (!mutable) {
 		err = -ENOMEM;
-		goto error_free_vport;
+		goto error_free_mac_table;
 	}
 	random_ether_addr(mutable->eth_addr);
 	rcu_assign_pointer(vxport->mutable, mutable);
@@ -220,6 +326,8 @@ vxlan_create(const struct vport_parms *parms)
 	if (err)
 		goto error_free_mutable;
 
+    rcu_assign_pointer (vxport->mac_table, mac_table);
+
 	spin_lock_init(&vxport->cache_lock);
 
 #ifdef NEED_CACHE_TIMEOUT
@@ -231,6 +339,8 @@ vxlan_create(const struct vport_parms *parms)
 
 error_free_mutable:
 	kfree(mutable);
+error_free_mac_table:
+    kfree (mac_table);
 error_free_vport:
 	ovs_vport_free(vport);
 error:
@@ -240,9 +350,14 @@ error:
 static void
 vxlan_destroy(struct vport *vport)
 {
-	struct vxlan_vport *vxport;
-    struct socket      *rcv_socket, *mcast_socket;
-    struct vxlan_mutable_config *mutable;
+	struct vxlan_vport            *vxport;
+    struct socket                 *rcv_socket, *mcast_socket;
+    struct vxlan_mutable_config   *mutable;
+    struct hlist_head             *mac_table;
+    struct vxlan_mac_entry        *vme;
+    struct hlist_node             *node;
+    struct hlist_head             *bucket;
+    int                            i;
 
 	vxport = vxlan_vport_priv(vport);
     rcv_socket = rtnl_dereference(vxport->rcv_socket);
@@ -253,6 +368,16 @@ vxlan_destroy(struct vport *vport)
     mutable = rtnl_dereference(vxport->mutable);
 	call_rcu(&mutable->rcu, vxlan_rcu_mutble_free_cb);
 
+    mac_table = rtnl_dereference(vxport->mac_table);
+    for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++) {
+        bucket = &mac_table [i];
+        hlist_for_each_entry_rcu(vme, node, bucket, hash_node) {
+            hlist_del_init_rcu (&vme->hash_node);
+            call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
+        }
+    }
+
+    vxlan_del_vxport (vxport);
 }
 
 static int
@@ -297,6 +422,7 @@ vxlan_parse_options (struct vxlan_mutable_config *mutable,
 {
 	struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1];
 	int err;
+    __be64  vni;
 
 	if (!options)
 		return -EINVAL;
@@ -317,8 +443,9 @@ vxlan_parse_options (struct vxlan_mutable_config *mutable,
 
 	mutable->flags = nla_get_u32(a[OVS_TUNNEL_ATTR_FLAGS]) & TNL_F_PUBLIC;
 	mutable->vtep = nla_get_be32(a[OVS_TUNNEL_ATTR_SRC_IPV4]);
-	mutable->vni = nla_get_be64(a[OVS_TUNNEL_ATTR_IN_KEY]);
 	mutable->mcast_ip = nla_get_be32(a[OVS_TUNNEL_ATTR_DST_IPV4]);
+	vni = nla_get_be64(a[OVS_TUNNEL_ATTR_IN_KEY]);
+	mutable->vni = (u32)(be64_to_cpu(vni) >> 40);
 
 	if (a[OVS_TUNNEL_ATTR_TOS]) {
 		mutable->tos = nla_get_u8(a[OVS_TUNNEL_ATTR_TOS]);
@@ -376,7 +503,7 @@ vxlan_set_options(struct vport *vport, struct nlattr *options)
     }
     
     pr_warn ("VNI: %d, VTEP: 0x%x:%d, MCAST: 0x%x:%d",
-             (int)be64_to_cpu(mutable->vni), mutable->vtep, mutable->vtep_port,
+             mutable->vni, mutable->vtep, mutable->vtep_port,
              mutable->mcast_ip, mutable->mcast_port);
     
     if ((mutable->vtep != old_mutable->vtep) ||
@@ -409,10 +536,13 @@ vxlan_set_options(struct vport *vport, struct nlattr *options)
 
 	rcu_assign_pointer(vxport->mutable, mutable);
 	call_rcu(&old_mutable->rcu, vxlan_rcu_mutble_free_cb);
+
+    vxlan_add_vxport (mutable->vni, vxport);
     
     pr_warn ("VNI: %d, VTEP: 0x%x:%d, MCAST: 0x%x:%d",
-             (int)be64_to_cpu(mutable->vni), mutable->vtep, mutable->vtep_port,
+             mutable->vni, mutable->vtep, mutable->vtep_port,
              mutable->mcast_ip, mutable->mcast_port);
+
 
 	return 0;
     
@@ -449,10 +579,10 @@ vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
 	if (nla_put_u16(skb, OVS_TUNNEL_ATTR_VTEP_PORT, mutable->vtep_port))
 		goto nla_put_failure;
 
-	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_IN_KEY, mutable->vni))
+	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_IN_KEY, cpu_to_be64(mutable->vni)))
 		goto nla_put_failure;
 
-	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_OUT_KEY, mutable->vni))
+	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_OUT_KEY, cpu_to_be64(mutable->vni)))
 		goto nla_put_failure;
 
 	if (nla_put_be32(skb, OVS_TUNNEL_ATTR_DST_IPV4, mutable->mcast_ip))
@@ -470,6 +600,44 @@ nla_put_failure:
 
 
 /* -- Traffic handling -- */
+
+static inline struct
+vxlanhdr *vxlan_hdr(const struct sk_buff *skb)
+{
+	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
+}
+
+#if 0
+static inline void
+vxlan_tunnel_build_header(void *header, __be64 tun_id)
+{
+	struct udphdr *udph = header;
+	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
+
+	udph->dest = htons(VXLAN_DST_PORT);
+	udph->check = 0;
+
+	vxh->vx_flags = htonl(VXLAN_FLAGS);
+	vxh->vx_vni = htonl(be64_to_cpu(tun_id) << 8);
+}
+#endif
+
+
+
+static void
+vxlan_mac_table_entry_learn (struct vxlan_vport *vxport, struct iphdr *iph, 
+        struct sk_buff *skb)
+{
+	struct ethhdr *eh;
+    struct vxlan_mutable_config *mutable;
+        
+    mutable = rcu_dereference_rtnl(vxport->mutable);
+	skb_reset_mac_header(skb);
+	eh = eth_hdr(skb);
+    vxlan_vme_add (vxport, iph->saddr, eh->h_source, 
+                      VXLAN_MAC_ENTRY_FLAGS_LEARNED);
+}
+
 static int
 vxlan_send(struct vport *vport, struct sk_buff *skb)
 {
@@ -480,13 +648,14 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
 static int
 vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 {
-#if 0
 	struct vport *vport;
+	struct vxlan_vport *vxport;
 	struct vxlanhdr *vxh;
-	const struct tnl_mutable_config *mutable;
+	//const struct vxlan_mutable_config *mutable;
 	struct iphdr *iph;
 	int tunnel_type;
 	__be64 key;
+    u32    vni;
 
 	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
 		goto error;
@@ -498,20 +667,21 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 
 	__skb_pull(skb, VXLAN_HLEN);
 
-	key = cpu_to_be64(ntohl(vxh->vx_vni) >> 8);
+    vni = ntohl(vxh->vx_vni) & 0x00FFFFFF;
+	key = cpu_to_be64(vni);
 
 	tunnel_type = TNL_T_PROTO_VXLAN;
+
+    /* - XXX
 	if (sec_path_esp(skb))
-		tunnel_type |= TNL_T_IPSEC;
+		tunnel_type |= TNL_T_IPSEC; */
 
 	iph = ip_hdr(skb);
-	vport = ovs_tnl_find_port(dev_net(skb->dev), iph->daddr, iph->saddr,
-		key, tunnel_type, &mutable);
-	if (unlikely(!vport)) {
+    vxport = vxlan_get_vxport (vni);
+	if (unlikely(vxport == NULL)) {
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
 	}
-
 	skb_postpull_rcsum(skb, skb_transport_header(skb), VXLAN_HLEN + ETH_HLEN);
 
 	/* Save outer tunnel values */
@@ -519,18 +689,15 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 	OVS_CB(skb)->tun_ipv4_dst = iph->daddr;
 	OVS_CB(skb)->tun_ipv4_tos = iph->tos;
 	OVS_CB(skb)->tun_ipv4_ttl = iph->ttl;
+    OVS_CB(skb)->tun_id = key;
 
-	if (mutable->flags & TNL_F_IN_KEY_MATCH)
-		OVS_CB(skb)->tun_id = key;
-	else
-		OVS_CB(skb)->tun_id = 0;
-
+    vxlan_mac_table_entry_learn (vxport, iph, skb);
+    vport = vport_from_priv(vxport);
 	ovs_tnl_rcv(vport, skb, iph->tos);
-	goto out;
+
+    return 0;
 
 error:
-#endif
-
 	kfree_skb(skb);
 
 	return 0;
@@ -575,14 +742,28 @@ vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
 
 
 void
-ovs_vxlan_exit () { }
+ovs_vxlan_exit () 
+{ 
+    if (vxport_table)
+        kfree (vxport_table);
+}
 
 int
 ovs_vxlan_init()
 {
-    return 0;
-}
+    int i;
 
+	vxport_table = kmalloc(VXPORT_TABLE_SIZE * sizeof(struct hlist_head *),
+            GFP_KERNEL);
+	if (vxport_table == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < VXPORT_TABLE_SIZE; i++)
+		INIT_HLIST_HEAD(&vxport_table[i]);
+
+
+	return 0;
+}
 
 #else
 #warning VXLAN tunneling will not be available on kernels before 2.6.26

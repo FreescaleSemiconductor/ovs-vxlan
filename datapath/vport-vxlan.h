@@ -41,17 +41,19 @@ struct vxlanhdr {
 };
 
 struct vxlan_mutable_config {
-	struct rcu_head   rcu;
-    __be64            vni;
+    struct rcu_head   rcu;
+    u32               vni;
     __be32            vtep;
     __be32            mcast_ip;
-	u32	              flags;
+
+    u32	              flags;
     u16               vtep_port;
     u16               mcast_port;
-	u8                eth_addr[ETH_ALEN];
-	u8	              tos;
-	u8	              ttl;
-	u32                seq;
+    u8                eth_addr[ETH_ALEN];
+
+    u8	              tos;
+    u8	              ttl;
+    u32               seq;
 
 };
 
@@ -79,9 +81,26 @@ struct vxlan_vport {
     struct net          *net;
     struct socket __rcu *rcv_socket;  /* VTEP receive socket */
     struct socket __rcu *mcast_socket; /* MULTICAST receive/send socket */
+    struct hlist_head __rcu *mac_table;
+};
+
+
+enum {
+    VXLAN_MAC_ENTRY_FLAGS_NONE = (0),
+    VXLAN_MAC_ENTRY_FLAGS_LEARNED = (1 << 0),
+    VXLAN_MAC_ENTRY_FLAGS_CONFIGURED = (1 << 1),
+};
+
+struct vxlan_mac_entry {
+    struct rcu_head    rcu;
+    struct hlist_node  hash_node;
+    __be32             peer; 
+    u8                 macaddr[ETH_ALEN];
+    u16                flags;
 };
 
 int ovs_vxlan_init (void);
 void ovs_vxlan_exit (void);
+
 #endif /* VPORT_VXLAN_H */
 
