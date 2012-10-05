@@ -40,48 +40,20 @@ struct vxlanhdr {
 	__be32 vx_vni;
 };
 
-struct vxlan_mutable_config {
-    struct rcu_head   rcu;
-    u32               vni;
-    __be32            vtep;
-    __be32            mcast_ip;
-
-    u32	              flags;
-    u16               vtep_port;
-    u16               mcast_port;
-    u8                eth_addr[ETH_ALEN];
-
-    u8	              tos;
-    u8	              ttl;
-    u32               seq;
-
-};
-
 struct vxlan_vport {
 	struct rcu_head rcu;
 	struct hlist_node hash_node;
 
 	char name[IFNAMSIZ];
 
-	struct vxlan_mutable_config __rcu *mutable;
-
-	spinlock_t cache_lock;
-	struct tnl_cache __rcu *cache;	/* Protected by RCU/cache_lock. */
-
-#ifdef NEED_CACHE_TIMEOUT
-	/*
-	 * If we must rely on expiration time to invalidate the cache, this is
-	 * the interval.  It is randomized within a range (defined by
-	 * MAX_CACHE_EXP in tunnel.c) to avoid synchronized expirations caused
-	 * by creation of a large number of tunnels at a one time.
-	 */
-	unsigned long cache_exp_interval;
-#endif
+	struct tnl_mutable_config __rcu *mutable;
 
     struct net          *net;
     struct socket __rcu *rcv_socket;  /* VTEP receive socket */
     struct socket __rcu *mcast_socket; /* MULTICAST receive/send socket */
     struct hlist_head __rcu *mac_table;
+
+    struct tnl_ops tnl_ops;
 };
 
 
@@ -98,6 +70,20 @@ struct vxlan_mac_entry {
     u8                 macaddr[ETH_ALEN];
     u16                flags;
 };
+
+
+static inline struct vxlanhdr *vxlan_hdr(const struct sk_buff *skb)
+{
+	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
+}
+
+#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+
+static inline int vxlan_hdr_len(const struct tnl_mutable_config *mutable)
+{
+	return VXLAN_HLEN;
+}
+
 
 int ovs_vxlan_init (void);
 void ovs_vxlan_exit (void);

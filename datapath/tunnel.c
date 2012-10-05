@@ -1184,11 +1184,19 @@ free_frags:
 	return sent_len;
 }
 
+
 int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	const struct tnl_mutable_config *mutable = rcu_dereference(tnl_vport->mutable);
+    return __ovs_tnl_send (vport, skb, mutable, tnl_vport->tnl_ops);
+}
 
+
+int __ovs_tnl_send(struct vport *vport, struct sk_buff *skb,
+	                const struct tnl_mutable_config *mutable,
+                    const struct tnl_ops *tnl_ops)
+{
 	enum vport_err_type err = VPORT_E_TX_ERROR;
 	struct rtable *rt;
 	struct dst_entry *unattached_dst = NULL;
@@ -1322,7 +1330,7 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 		iph->frag_off = frag_off;
 		ip_select_ident(iph, &rt_dst(rt), NULL);
 
-		skb = tnl_vport->tnl_ops->update_header(vport, mutable,
+		skb = tnl_ops->update_header(vport, mutable,
 							&rt_dst(rt), skb);
 		if (unlikely(!skb))
 			goto next;

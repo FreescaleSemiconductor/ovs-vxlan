@@ -122,6 +122,13 @@ struct tnl_mutable_config {
 
 	/* Multicast configuration. */
 	int	mlink;
+
+    /* VXLAN sepcific configuration */
+    u32               vni;
+    __be32            vtep;
+    __be32            mcast_ip;
+    u16               vtep_port;
+    u16               mcast_port;
 };
 
 struct tnl_ops {
@@ -280,6 +287,9 @@ int ovs_tnl_set_addr(struct vport *vport, const unsigned char *addr);
 const char *ovs_tnl_get_name(const struct vport *vport);
 const unsigned char *ovs_tnl_get_addr(const struct vport *vport);
 int ovs_tnl_send(struct vport *vport, struct sk_buff *skb);
+int __ovs_tnl_send(struct vport *vport, struct sk_buff *skb,
+	                const struct tnl_mutable_config *mutable,
+                    const struct tnl_ops *tnl_ops);
 void ovs_tnl_rcv(struct vport *vport, struct sk_buff *skb, u8 tos);
 
 struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
