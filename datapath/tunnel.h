@@ -274,7 +274,18 @@ struct tnl_vport {
 	 */
 	unsigned long cache_exp_interval;
 #endif
+
+    struct socket __rcu *vxlan_rcv_socket;  /* VTEP receive socket */
+    struct socket __rcu *vxlan_mcast_socket; /* MULTICAST socket */
+    struct hlist_head __rcu *vxlan_mac_table;
+
 };
+
+
+static inline u32 port_hash(const struct port_lookup_key *key)
+{
+	return jhash2((u32 *)key, (PORT_KEY_LEN / sizeof(u32)), 0);
+}
 
 struct vport *ovs_tnl_create(const struct vport_parms *, const struct vport_ops *,
 			     const struct tnl_ops *);
@@ -287,9 +298,6 @@ int ovs_tnl_set_addr(struct vport *vport, const unsigned char *addr);
 const char *ovs_tnl_get_name(const struct vport *vport);
 const unsigned char *ovs_tnl_get_addr(const struct vport *vport);
 int ovs_tnl_send(struct vport *vport, struct sk_buff *skb);
-int __ovs_tnl_send(struct vport *vport, struct sk_buff *skb,
-	                const struct tnl_mutable_config *mutable,
-                    const struct tnl_ops *tnl_ops);
 void ovs_tnl_rcv(struct vport *vport, struct sk_buff *skb, u8 tos);
 
 struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
@@ -300,11 +308,30 @@ bool ovs_tnl_frag_needed(struct vport *vport,
 			 struct sk_buff *skb, unsigned int mtu, __be64 flow_key);
 void ovs_tnl_free_linked_skbs(struct sk_buff *skb);
 
+void ovs_tnl_port_table_add_port(struct vport *vport);
+void ovs_tnl_port_table_move_port(struct vport *vport,
+                            struct tnl_mutable_config *new_mutable);
+void ovs_tnl_port_table_remove_port(struct vport *vport);
+struct vport * ovs_tnl_port_table_lookup(struct port_lookup_key *key,
+				       const struct tnl_mutable_config **pmutable);
+void ovs_tnl_assign_config_rcu(struct vport *vport,
+			      struct tnl_mutable_config *new_config);
+void ovs_tnl_free_config_rcu(struct rcu_head *rcu);
+void ovs_tnl_free_mutable_rtnl(struct tnl_mutable_config *mutable);
+void ovs_tnl_port_table_dump (void);
+
 int ovs_tnl_init(void);
 void ovs_tnl_exit(void);
+
 static inline struct tnl_vport *tnl_vport_priv(const struct vport *vport)
 {
 	return vport_priv(vport);
+}
+
+static inline struct 
+vport *tnl_vport_to_vport(const struct tnl_vport *tnl_vport)
+{
+        return vport_from_priv(tnl_vport);
 }
 
 #endif /* tunnel.h */

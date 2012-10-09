@@ -101,6 +101,7 @@ static unsigned int key_multicast_ports __read_mostly;
 static unsigned int local_remote_ports __read_mostly;
 static unsigned int remote_ports __read_mostly;
 static unsigned int multicast_ports __read_mostly;
+char k1 [1024], k2 [1024];
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
 #define rt_dst(rt) (rt->dst)
@@ -120,11 +121,6 @@ static struct hh_cache *rt_hh(struct rtable *rt)
 #else
 #define rt_hh(rt) (rt_dst(rt).hh)
 #endif
-
-static struct vport *tnl_vport_to_vport(const struct tnl_vport *tnl_vport)
-{
-	return vport_from_priv(tnl_vport);
-}
 
 /* This is analogous to rtnl_dereference for the tunnel cache.  It checks that
  * cache_lock is held, so it is only for update side code.
@@ -150,7 +146,7 @@ static void free_cache(struct tnl_cache *cache)
 	kfree(cache);
 }
 
-static void free_config_rcu(struct rcu_head *rcu)
+void ovs_tnl_free_config_rcu(struct rcu_head *rcu)
 {
 	struct tnl_mutable_config *c = container_of(rcu, struct tnl_mutable_config, rcu);
 	kfree(c);
@@ -166,7 +162,7 @@ static void free_cache_rcu(struct rcu_head *rcu)
  * within an RCU callback.  Fortunately this part doesn't require waiting for
  * an RCU grace period.
  */
-static void free_mutable_rtnl(struct tnl_mutable_config *mutable)
+void ovs_tnl_free_mutable_rtnl(struct tnl_mutable_config *mutable)
 {
 	ASSERT_RTNL();
 	if (ipv4_is_multicast(mutable->key.daddr) && mutable->mlink) {
@@ -177,7 +173,7 @@ static void free_mutable_rtnl(struct tnl_mutable_config *mutable)
 	}
 }
 
-static void assign_config_rcu(struct vport *vport,
+void ovs_tnl_assign_config_rcu(struct vport *vport,
 			      struct tnl_mutable_config *new_config)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
@@ -186,8 +182,8 @@ static void assign_config_rcu(struct vport *vport,
 	old_config = rtnl_dereference(tnl_vport->mutable);
 	rcu_assign_pointer(tnl_vport->mutable, new_config);
 
-	free_mutable_rtnl(old_config);
-	call_rcu(&old_config->rcu, free_config_rcu);
+	ovs_tnl_free_mutable_rtnl(old_config);
+	call_rcu(&old_config->rcu, ovs_tnl_free_config_rcu);
 }
 
 static void assign_cache_rcu(struct vport *vport, struct tnl_cache *new_cache)
@@ -223,17 +219,12 @@ static unsigned int *find_port_pool(const struct tnl_mutable_config *mutable)
 	}
 }
 
-static u32 port_hash(const struct port_lookup_key *key)
-{
-	return jhash2((u32 *)key, (PORT_KEY_LEN / sizeof(u32)), 0);
-}
-
 static struct hlist_head *find_bucket(u32 hash)
 {
 	return &port_table[(hash & (PORT_TABLE_SIZE - 1))];
 }
 
-static void port_table_add_port(struct vport *vport)
+void ovs_tnl_port_table_add_port(struct vport *vport)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	const struct tnl_mutable_config *mutable;
@@ -250,8 +241,8 @@ static void port_table_add_port(struct vport *vport)
 	(*find_port_pool(rtnl_dereference(tnl_vport->mutable)))++;
 }
 
-static void port_table_move_port(struct vport *vport,
-		      struct tnl_mutable_config *new_mutable)
+void ovs_tnl_port_table_move_port(struct vport *vport,
+                            struct tnl_mutable_config *new_mutable)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	u32 hash;
@@ -261,11 +252,11 @@ static void port_table_move_port(struct vport *vport,
 	hlist_add_head_rcu(&tnl_vport->hash_node, find_bucket(hash));
 
 	(*find_port_pool(rtnl_dereference(tnl_vport->mutable)))--;
-	assign_config_rcu(vport, new_mutable);
+	ovs_tnl_assign_config_rcu(vport, new_mutable);
 	(*find_port_pool(rtnl_dereference(tnl_vport->mutable)))++;
 }
 
-static void port_table_remove_port(struct vport *vport)
+void ovs_tnl_port_table_remove_port(struct vport *vport)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 
@@ -278,7 +269,7 @@ static void port_table_remove_port(struct vport *vport)
 	(*find_port_pool(rtnl_dereference(tnl_vport->mutable)))--;
 }
 
-static struct vport *port_table_lookup(struct port_lookup_key *key,
+struct vport * ovs_tnl_port_table_lookup(struct port_lookup_key *key,
 				       const struct tnl_mutable_config **pmutable)
 {
 	struct hlist_node *n;
@@ -292,14 +283,64 @@ static struct vport *port_table_lookup(struct port_lookup_key *key,
 		struct tnl_mutable_config *mutable;
 
 		mutable = rcu_dereference_rtnl(tnl_vport->mutable);
+        pr_warn ("KEY: 0x%llx(0x%llx), NET: %p(%p), TYPE: 0x%x(0x%x)",
+                mutable->key.in_key,  key->in_key,
+                mutable->key.net, key->net,
+                mutable->key.tunnel_type, key->tunnel_type);
+
+        if ((mutable->key.in_key == key->in_key) && 
+                (mutable->key.net == key->net) &&
+                (mutable->key.tunnel_type == key->tunnel_type)) {
+			*pmutable = mutable;
+			return tnl_vport_to_vport(tnl_vport);
+        }
+
 		if (!memcmp(&mutable->key, key, PORT_KEY_LEN)) {
 			*pmutable = mutable;
 			return tnl_vport_to_vport(tnl_vport);
 		}
+        else {
+            u8 * str; 
+            int i;
+            str = (u8 *)&mutable->key;
+            for (i = 0; i < PORT_KEY_LEN; i++) {
+                k1 [i] = str[i];
+            }
+            k1 [i] = '\0';
+            str = (u8 *)key;
+            for (i = 0; i < PORT_KEY_LEN; i++) {
+                k2 [i] = str[i];
+            }
+            k2 [i] = '\0';
+
+
+            pr_warn ("PORT NOT FOUND[l=%d], %s!=%s", PORT_KEY_LEN, k1, k2);
+        }
 	}
 
 	return NULL;
 }
+
+void ovs_tnl_port_table_dump ()
+{
+    int  i;
+
+	for (i = 0; i < PORT_TABLE_SIZE; i++) {
+		struct hlist_node *n;
+		struct hlist_head *bucket;
+		struct tnl_vport *tnl_vport;
+
+		bucket = &port_table[i];
+		hlist_for_each_entry_rcu(tnl_vport, n, bucket, hash_node) {
+		    struct tnl_mutable_config *mutable;
+            mutable = rcu_dereference_rtnl(tnl_vport->mutable);
+            pr_warn ("KEY: 0x%llx, NET: %p, TYPE: 0x%x",
+                    mutable->key.in_key, mutable->key.net, 
+                    mutable->key.tunnel_type);
+        }
+	}
+}
+
 
 struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 				__be64 key, int tunnel_type,
@@ -317,13 +358,13 @@ struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 	lookup.in_key = key;
 	lookup.tunnel_type = tunnel_type | TNL_T_KEY_EXACT;
 	if (!is_multicast && key_local_remote_ports) {
-		vport = port_table_lookup(&lookup, mutable);
+		vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 		if (vport)
 			return vport;
 	}
 	if (key_remote_ports) {
 		lookup.saddr = 0;
-		vport = port_table_lookup(&lookup, mutable);
+		vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 		if (vport)
 			return vport;
 
@@ -334,13 +375,13 @@ struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 	lookup.in_key = 0;
 	lookup.tunnel_type = tunnel_type | TNL_T_KEY_MATCH;
 	if (!is_multicast && local_remote_ports) {
-		vport = port_table_lookup(&lookup, mutable);
+		vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 		if (vport)
 			return vport;
 	}
 	if (remote_ports) {
 		lookup.saddr = 0;
-		vport = port_table_lookup(&lookup, mutable);
+		vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 		if (vport)
 			return vport;
 	}
@@ -351,14 +392,14 @@ struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 		if (key_multicast_ports) {
 			lookup.tunnel_type = tunnel_type | TNL_T_KEY_EXACT;
 			lookup.in_key = key;
-			vport = port_table_lookup(&lookup, mutable);
+			vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 			if (vport)
 				return vport;
 		}
 		if (multicast_ports) {
 			lookup.tunnel_type = tunnel_type | TNL_T_KEY_MATCH;
 			lookup.in_key = 0;
-			vport = port_table_lookup(&lookup, mutable);
+			vport = ovs_tnl_port_table_lookup(&lookup, mutable);
 			if (vport)
 				return vport;
 		}
@@ -1184,19 +1225,11 @@ free_frags:
 	return sent_len;
 }
 
-
 int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	const struct tnl_mutable_config *mutable = rcu_dereference(tnl_vport->mutable);
-    return __ovs_tnl_send (vport, skb, mutable, tnl_vport->tnl_ops);
-}
 
-
-int __ovs_tnl_send(struct vport *vport, struct sk_buff *skb,
-	                const struct tnl_mutable_config *mutable,
-                    const struct tnl_ops *tnl_ops)
-{
 	enum vport_err_type err = VPORT_E_TX_ERROR;
 	struct rtable *rt;
 	struct dst_entry *unattached_dst = NULL;
@@ -1330,7 +1363,7 @@ int __ovs_tnl_send(struct vport *vport, struct sk_buff *skb,
 		iph->frag_off = frag_off;
 		ip_select_ident(iph, &rt_dst(rt), NULL);
 
-		skb = tnl_ops->update_header(vport, mutable,
+		skb = tnl_vport->tnl_ops->update_header(vport, mutable,
 							&rt_dst(rt), skb);
 		if (unlikely(!skb))
 			goto next;
@@ -1456,7 +1489,7 @@ static int tnl_set_config(struct net *net, struct nlattr *options,
 
 	mutable->tunnel_hlen += sizeof(struct iphdr);
 
-	old_vport = port_table_lookup(&mutable->key, &old_mutable);
+	old_vport = ovs_tnl_port_table_lookup(&mutable->key, &old_mutable);
 	if (old_vport && old_vport != cur_vport)
 		return -EEXIST;
 
@@ -1525,11 +1558,11 @@ struct vport *ovs_tnl_create(const struct vport_parms *parms,
 
 	rcu_assign_pointer(tnl_vport->mutable, mutable);
 
-	port_table_add_port(vport);
+	ovs_tnl_port_table_add_port(vport);
 	return vport;
 
 error_free_mutable:
-	free_mutable_rtnl(mutable);
+	ovs_tnl_free_mutable_rtnl(mutable);
 	kfree(mutable);
 error_free_vport:
 	ovs_vport_free(vport);
@@ -1562,14 +1595,14 @@ int ovs_tnl_set_options(struct vport *vport, struct nlattr *options)
 		goto error_free;
 
 	if (port_hash(&mutable->key) != port_hash(&old_mutable->key))
-		port_table_move_port(vport, mutable);
+		ovs_tnl_port_table_move_port(vport, mutable);
 	else
-		assign_config_rcu(vport, mutable);
+		ovs_tnl_assign_config_rcu(vport, mutable);
 
 	return 0;
 
 error_free:
-	free_mutable_rtnl(mutable);
+	ovs_tnl_free_mutable_rtnl(mutable);
 	kfree(mutable);
 error:
 	return err;
@@ -1621,8 +1654,8 @@ void ovs_tnl_destroy(struct vport *vport)
 	struct tnl_mutable_config *mutable;
 
 	mutable = rtnl_dereference(tnl_vport->mutable);
-	port_table_remove_port(vport);
-	free_mutable_rtnl(mutable);
+    ovs_tnl_port_table_remove_port(vport);
+	ovs_tnl_free_mutable_rtnl(mutable);
 	call_rcu(&tnl_vport->rcu, free_port_rcu);
 }
 
@@ -1639,7 +1672,7 @@ int ovs_tnl_set_addr(struct vport *vport, const unsigned char *addr)
 	old_mutable->mlink = 0;
 
 	memcpy(mutable->eth_addr, addr, ETH_ALEN);
-	assign_config_rcu(vport, mutable);
+	ovs_tnl_assign_config_rcu(vport, mutable);
 
 	return 0;
 }
