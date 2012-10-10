@@ -17,6 +17,8 @@
 #include <linux/udp.h>
 #include <linux/xfrm.h>
 #include <linux/igmp.h>                 /* for ip_mc_join_group */
+#include <linux/in_route.h>
+#include <linux/inetdevice.h>
 
 #include <net/icmp.h>
 #include <net/ip.h>
@@ -30,7 +32,6 @@
 #include "vport-vxlan.h"
 
 #define UDP_ENCAP_VXLAN (10)
-#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
 #define VXPORT_TABLE_SIZE  (1024)
 #define VXLAN_MAC_TABLE_SIZE  (1024)
 
@@ -50,8 +51,10 @@ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb);
 static int vxlan_send(struct vport *vport, struct sk_buff *skb);
 static int vxlan_rcv(struct sock *sk, struct sk_buff *skb);
 static int vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb);
-static void vxlan_mac_table_entry_learn (struct tnl_vport *vxport, struct iphdr *iph, struct sk_buff *skb);
-static struct vxlan_mac_entry *vxlan_vme_get_peer_vtep (struct tnl_vport *vxport, u8 *macaddr);
+static void vxlan_mac_table_entry_learn (struct tnl_vport *vxport, 
+        struct iphdr *iph, struct sk_buff *skb);
+static struct vxlan_mac_entry *vxlan_vme_get_peer_vtep (struct tnl_vport 
+        *vxport, u8 *macaddr);
 static struct sk_buff * vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
 					struct dst_entry *dst, struct sk_buff *skb);
@@ -121,9 +124,8 @@ vxlan_vme_add (struct tnl_vport *vxport, __be32 peer_vtep,
         if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED)
             vme->peer = peer_vtep;
 
-#if 0
-    OVS_VXLAN_DEBUG("Existing vme. vni: %d, saddr: 0x%x, mac:%x:%x:%x:%x:%x:%x, " 
-            "flags: 0x%x",
+    OVS_VXLAN_DEBUG("Existing vme. vni: %d, saddr: 0x%x, "
+            "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
             rtnl_dereference(vxport->mutable)->vni,
             vme->peer, 
             vme->macaddr[0], 
@@ -133,7 +135,6 @@ vxlan_vme_add (struct tnl_vport *vxport, __be32 peer_vtep,
             vme->macaddr[4], 
             vme->macaddr[5], 
             vme->flags);
-#endif
 
         return 0;
     }
@@ -151,7 +152,7 @@ vxlan_vme_add (struct tnl_vport *vxport, __be32 peer_vtep,
     bucket = &mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
     hlist_add_head_rcu (&vme->hash_node, bucket);
 
-    OVS_VXLAN_DEBUG("New vme. vni: %d, saddr: 0x%x, mac:%x:%x:%x:%x:%x:%x, " 
+    OVS_VXLAN_DEBUG("NEW VME. vni: %d, saddr: 0x%x, mac:%x:%x:%x:%x:%x:%x, " 
             "flags: 0x%x",
             rtnl_dereference(vxport->mutable)->vni,
             vme->peer, 
@@ -187,6 +188,34 @@ vxlan_vme_get_peer_vtep (struct tnl_vport *vxport, u8 *macaddr)
     return NULL;
 }
 
+static int 
+vxlan_mc_join (struct net * net, __be32 saddr, __be32 daddr)
+{
+    struct net_device *dev;
+    struct rtable *rt;
+    struct flowi4  fl;
+
+    memset(&fl, 0, sizeof(fl));
+    fl.daddr = daddr;
+    fl.saddr = saddr;
+    fl.flowi4_tos = 0;
+    fl.flowi4_proto = IPPROTO_UDP;
+
+    rt = ip_route_output_key(net, &fl);
+    if (IS_ERR (rt)) {
+        pr_warn (" --> Route error. rt=%p", rt);
+        return -EHOSTUNREACH;
+    }
+
+    dev = rt_dst(rt).dev;
+    ip_rt_put(rt);
+    if (__in_dev_get_rtnl(dev) == NULL)
+        return -EADDRNOTAVAIL;
+    ip_mc_inc_group(__in_dev_get_rtnl(dev), daddr);
+
+    return 0;
+}
+
 static int
 vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
 {
@@ -218,47 +247,26 @@ vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
         udp_sk(sk)->encap_rcv = vxlan_rcv;
         return 0;
     }
-	udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
 
-    return 0;
+	udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
 
     /* Add to multicast group that we are interested in. */
 	memset(&mreq, 0, sizeof(mreq));
     mreq.imr_multiaddr.s_addr = addr;
     //mreq.imr_address.s_addr = addr;
 
+    err = vxlan_mc_join (sock_net(sk), 0, 0x373700e0);
+#if 0
 	lock_sock(sk);
     err = ip_mc_join_group (sk, &mreq);
 	release_sock(sk);
+#endif
 
     if (err < 0) {
         pr_warn("Failed to set multicast socket option --> %d", err);
         goto error_sock;
     }
 
-#if 0
-    struct net_device *dev;
-    struct rtable *rt;
-    struct flowi4  fl;
-    memset(&fl, 0, sizeof(fl));
-    fl.daddr = addr;
-    fl.saddr = 0;
-    fl.flowi4_tos = 0;
-    fl.flowi4_proto = IPPROTO_UDP;
-    
-    rt = ip_route_output_key(net, &fl);
-    if (IS_ERR (rt)) {
-        pr_warn (" --> Route error. rt=%p", rt);
-        return -1;
-    }
-    
-    dev = ovs_rt_dst(rt).dev;
-    ip_rt_put(rt);
-    if (__in_dev_get_rtnl(dev) == NULL)
-        return -EADDRNOTAVAIL;
-    ip_mc_inc_group(__in_dev_get_rtnl(dev), daddr);
-#endif
-    
     return 0;
 
  error_sock:
@@ -271,9 +279,15 @@ vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
 static void
 vxlan_close_socket (struct socket *socket)
 {
+    __be32 saddr;
+
     if (socket == NULL)
         return;
     
+    saddr = inet_sk(socket->sk)->inet_rcv_saddr;
+    if (ipv4_is_multicast(saddr) == true) {
+    }
+
     sock_release (socket);
 }
 
@@ -383,6 +397,7 @@ vxlan_destroy(struct vport *vport)
             call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
         }
     }
+
     ovs_tnl_destroy (vport);
 }
 
@@ -412,7 +427,6 @@ vxlan_parse_options (struct tnl_mutable_config *mutable,
 
 	err = nla_parse_nested(a, OVS_TUNNEL_ATTR_MAX, options, vxlan_nl_policy);
 	if (err) {
-        pr_warn("%s:%d", __FILE__, __LINE__);
 		return err;
     }
 
@@ -420,7 +434,6 @@ vxlan_parse_options (struct tnl_mutable_config *mutable,
         !a[OVS_TUNNEL_ATTR_SRC_IPV4] ||
         !a[OVS_TUNNEL_ATTR_IN_KEY] ||
         !a[OVS_TUNNEL_ATTR_DST_IPV4]) {
-        pr_warn("%s:%d", __FILE__, __LINE__);
 		return -EINVAL;
     }
 
@@ -434,7 +447,6 @@ vxlan_parse_options (struct tnl_mutable_config *mutable,
 		mutable->tos = nla_get_u8(a[OVS_TUNNEL_ATTR_TOS]);
 		/* Reject ToS config with ECN bits set. */
 		if (mutable->tos & INET_ECN_MASK) {
-            pr_warn("%s:%d", __FILE__, __LINE__);
 			return -EINVAL;
         }
 	}
@@ -478,28 +490,25 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
         pr_warn ("%s:%d", __FILE__, __LINE__);
         goto error;
     }
-
     
     pr_warn ("NEW -> VNI: %d, VTEP: 0x%x:%d, MCAST: 0x%x:%d, NET: %p",
              mutable->vni, mutable->vtep, mutable->vtep_port,
              mutable->mcast_ip, mutable->mcast_port,
              ovs_dp_get_net(vport->dp));
 
+    mutable->tunnel_hlen = VXLAN_HLEN + sizeof (struct iphdr);
     mutable->out_key = cpu_to_be64(mutable->vni);
-    mutable->tunnel_hlen = TNL_T_PROTO_VXLAN;
-
 	port_key_set_net(&mutable->key, ovs_dp_get_net(vport->dp));
     mutable->key.in_key = cpu_to_be64(mutable->vni);
     mutable->key.tunnel_type = (TNL_T_PROTO_VXLAN | TNL_T_KEY_EXACT);
 
-    /*if (mutable->flags & TNL_F_IPSEC)
+    /* XXX if (mutable->flags & TNL_F_IPSEC)
         mutable->key.tunnel_type |= TNL_T_IPSEC;*/
     
     /* Let's check if we already have an interface persent with same VNI */
     if (mutable->vni != old_mutable->vni) {
         struct port_lookup_key key;
         const struct tnl_mutable_config *m;
-
         memcpy (&key, &mutable->key, sizeof(struct port_lookup_key));
         if (unlikely (ovs_tnl_port_table_lookup (&key, &m))) {
             pr_warn("An interface already exits with the same VNI: %d", 
@@ -516,7 +525,6 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
             pr_warn ("%s:%d", __FILE__, __LINE__);
             goto error;
         }
-
         old_rcv_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
         rcu_assign_pointer(vxport->vxlan_rcv_socket, rcv_socket);
         vxlan_close_socket (old_rcv_socket);
@@ -648,7 +656,7 @@ vxlan_build_header(const struct vport *vport,
 	udph->check = 0;
 
 	vxh->vx_flags = htonl(VXLAN_FLAGS);
-	vxh->vx_vni = htonl(mutable->vni);
+	vxh->vx_vni = htonl(mutable->vni << 8);
 }
 
 static struct sk_buff *
@@ -662,7 +670,7 @@ vxlan_update_header(const struct vport *vport,
 	if (mutable->flags & TNL_F_OUT_KEY_ACTION)
 		vxh->vx_vni = htonl(mutable->vni);
 
-	udph->source = htons(mutable->vtep_port);
+	udph->source = htons(mutable->vtep_port); 
 	udph->len = htons(skb->len - skb_transport_offset(skb));
 
 	/*
@@ -704,19 +712,22 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
 
 	vxport = tnl_vport_priv(vport);
     mutable = rtnl_dereference(vxport->mutable);
-
 	eh = eth_hdr(skb);
 	iph = ip_hdr(skb);
 
     vme = vxlan_vme_get_peer_vtep (vxport, eh->h_dest);
 
-    OVS_VXLAN_DEBUG("vxlan_send[VNI=%d]: saddr: 0x%x, daddr: 0x%x, "
-            "smac:%x:%x:%x:%x:%x:%x, " 
-            "dmac:%x:%x:%x:%x:%x:%x, "
+    OVS_VXLAN_DEBUG("vxlan_send[VNI=%d,len=%d]: "
+            "SMAC:%x:%x:%x:%x:%x:%x, " 
+            "DMAC:%x:%x:%x:%x:%x:%x, "
+            "ETH_TYPE: 0x%x, "
+            "saddr: 0x%x, "
+            "daddr: 0x%x, "
+            "VERSION: %d, "
             "PEER: 0x%x ",
             mutable->vni,
-            iph->saddr,
-            iph->daddr,
+            skb->len,
+
             eh->h_source[0], 
             eh->h_source[1], 
             eh->h_source[2], 
@@ -730,39 +741,44 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
             eh->h_dest[3], 
             eh->h_dest[4], 
             eh->h_dest[5],
+            ntohs(eh->h_proto),
+
+            iph->saddr,
+            iph->daddr,
+            iph->version,
             ((vme) ? vme->peer : 0)
             );
 
-    if (vme) {
-        int len;
-        /*
-         * Saving the port info in the SKB itself saves us some trouble.
-         * Explaination comes later! TODO
-         */
-        OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
-        OVS_CB(skb)->tun_ipv4_dst = vme->peer;
-        OVS_CB(skb)->vxlan_udp_port = mutable->vtep_port;
+    OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
 
-        len = ovs_tnl_send (vport, skb);
-        pr_warn ("Sent len: %d", len);
+    //mutable->flags |= TNL_F_HDR_CACHE;
+
+    if (vme) {
+        OVS_CB(skb)->tun_ipv4_dst = vme->peer;
     }
-    else {
+    else if (mutable->mcast_ip) {
         /* 
          * We could not find the PEER VTEP for this mac address. This is 
          * where we want to do the multicast.
-         * XXX - Multicast route.
          */
+        OVS_CB(skb)->tun_ipv4_dst = mutable->mcast_ip;
+    }
+    else {
+        pr_warn ("Mulicast is not configured.");
         goto error;
     }
 
+    return ovs_tnl_send (vport, skb);
+
 error:
+    ovs_vport_record_error(vport, VPORT_E_TX_DROPPED);
     kfree_skb(skb);
     return 0;
 }
 
 /* Called with rcu_read_lock and BH disabled. */
 static int
-vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 {
     struct port_lookup_key key;
     const struct tnl_mutable_config *m;
@@ -778,9 +794,16 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 	iph = ip_hdr(skb);
 	vxh = vxlan_hdr(skb);
 
+    pr_warn ("vxlan_rcv_process: %s(%d): SRC: 0x%x, DST: 0x%x",
+            ((multicast == true) ? "MCAST" : "NORMAL"),
+            multicast,
+            iph->saddr, iph->daddr);
+
 	if (unlikely(vxh->vx_flags != htonl(VXLAN_FLAGS) ||
-		     vxh->vx_vni & htonl(0xff)))
+		     vxh->vx_vni & htonl(0xff))) {
+        pr_warn ("---- VNI. FLAGS error ---");
 		goto error;
+    }
 
     vni = ntohl(vxh->vx_vni) >> 8;
 
@@ -792,8 +815,6 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
     vport = ovs_tnl_port_table_lookup (&key, &m);
 	if (unlikely(vport == NULL)) {
         ovs_tnl_port_table_dump ();
-        /*OVS_VXLAN_DEBUG("VXPORT not found for vni: %d, saddr: 0x%x, NET: %p",
-                vni, iph->saddr, dev_net(skb->dev));*/
         OVS_VXLAN_DEBUG("VXPORT not found. KEY: 0x%llx, NET: %p, TYPE: 0x%x",
                 key.in_key, key.net, key.tunnel_type);
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
@@ -802,20 +823,17 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 
 	__skb_pull(skb, VXLAN_HLEN);
 
-    /* - XXXX
-	tunnel_type = TNL_T_PROTO_VXLAN;
-	if (sec_path_esp(skb))
+    /* - XXXX tunnel_type = TNL_T_PROTO_VXLAN; if (sec_path_esp(skb))
 		tunnel_type |= TNL_T_IPSEC; */
 
-
 	skb_postpull_rcsum(skb, skb_transport_header(skb), VXLAN_HLEN + ETH_HLEN);
-
     vxport = tnl_vport_priv (vport);
+
     vxlan_mac_table_entry_learn (vxport, iph, skb);
 
 	/* Save outer tunnel values */
 	OVS_CB(skb)->tun_ipv4_src = iph->saddr;
-	OVS_CB(skb)->tun_ipv4_dst = iph->daddr;
+	OVS_CB(skb)->tun_ipv4_dst = iph->daddr;/* XXX What should we do for MCAST*/
 	OVS_CB(skb)->tun_ipv4_tos = iph->tos;
 	OVS_CB(skb)->tun_ipv4_ttl = iph->ttl;
     OVS_CB(skb)->tun_id = key.in_key;
@@ -825,46 +843,34 @@ vxlan_rcv(struct sock *sk, struct sk_buff *skb)
     return 0;
 
 error:
+    ovs_vport_record_error(vport, VPORT_E_RX_DROPPED);
 	kfree_skb(skb);
-
 	return 0;
 }
 
 /* Called with rcu_read_lock and BH disabled. */
 static int
+vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+{
+    return vxlan_rcv_process (sk, skb, false);
+}
+
+static int
 vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	struct iphdr    *iph;
-    struct udphdr   *udp;
-    static int       count;
     __be32           saddr;
 
     saddr = inet_sk(sk)->inet_rcv_saddr;
-    udp = udp_hdr(skb);
 	iph = ip_hdr(skb);
 
     if (iph->saddr == saddr) {
+        pr_warn ("This packet is sent by us: 0x%x", iph->saddr);
         /* This packet is sent by us. Discard */
         kfree_skb(skb);
         return 0;
     }
-    count++;
-
-    pr_warn ("--> udplen=%d, skblen=%d, headroom=%d, skbdatalen=%d, "
-             "transporoffset=%d, networkoffset=%d",
-             ntohs(udp->len),
-             skb->len,
-             skb_headroom(skb),
-             skb->data_len,
-             skb_transport_offset(skb),
-             skb_network_offset(skb)
-             );
-
-    //ovs_vxlan_udp_send_skb (sk, skb);
-
-	kfree_skb(skb);
-
-	return 0;
+    return vxlan_rcv_process (sk, skb, true);
 }
 
 #else

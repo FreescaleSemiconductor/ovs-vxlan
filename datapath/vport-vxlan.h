@@ -40,22 +40,6 @@ struct vxlanhdr {
 	__be32 vx_vni;
 };
 
-struct vxlan_vport {
-	struct rcu_head rcu;
-	struct hlist_node hash_node;
-
-	char name[IFNAMSIZ];
-
-	struct tnl_mutable_config __rcu *mutable;
-
-    struct net          *net;
-    struct socket __rcu *rcv_socket;  /* VTEP receive socket */
-    struct socket __rcu *mcast_socket; /* MULTICAST receive/send socket */
-    struct hlist_head __rcu *mac_table;
-
-    struct tnl_ops tnl_ops;
-};
-
 
 enum {
     VXLAN_MAC_ENTRY_FLAGS_NONE = (0),

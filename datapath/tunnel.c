@@ -103,12 +103,6 @@ static unsigned int remote_ports __read_mostly;
 static unsigned int multicast_ports __read_mostly;
 char k1 [1024], k2 [1024];
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
-#define rt_dst(rt) (rt->dst)
-#else
-#define rt_dst(rt) (rt->u.dst)
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,1,0)
 static struct hh_cache *rt_hh(struct rtable *rt)
 {
@@ -283,39 +277,11 @@ struct vport * ovs_tnl_port_table_lookup(struct port_lookup_key *key,
 		struct tnl_mutable_config *mutable;
 
 		mutable = rcu_dereference_rtnl(tnl_vport->mutable);
-        pr_warn ("KEY: 0x%llx(0x%llx), NET: %p(%p), TYPE: 0x%x(0x%x)",
-                mutable->key.in_key,  key->in_key,
-                mutable->key.net, key->net,
-                mutable->key.tunnel_type, key->tunnel_type);
-
-        if ((mutable->key.in_key == key->in_key) && 
-                (mutable->key.net == key->net) &&
-                (mutable->key.tunnel_type == key->tunnel_type)) {
-			*pmutable = mutable;
-			return tnl_vport_to_vport(tnl_vport);
-        }
 
 		if (!memcmp(&mutable->key, key, PORT_KEY_LEN)) {
 			*pmutable = mutable;
 			return tnl_vport_to_vport(tnl_vport);
 		}
-        else {
-            u8 * str; 
-            int i;
-            str = (u8 *)&mutable->key;
-            for (i = 0; i < PORT_KEY_LEN; i++) {
-                k1 [i] = str[i];
-            }
-            k1 [i] = '\0';
-            str = (u8 *)key;
-            for (i = 0; i < PORT_KEY_LEN; i++) {
-                k2 [i] = str[i];
-            }
-            k2 [i] = '\0';
-
-
-            pr_warn ("PORT NOT FOUND[l=%d], %s!=%s", PORT_KEY_LEN, k1, k2);
-        }
 	}
 
 	return NULL;
@@ -847,6 +813,8 @@ static void create_tunnel_header(const struct vport *vport,
 	if (!iph->ttl)
 		iph->ttl = ip4_dst_hoplimit(&rt_dst(rt));
 
+    pr_warn ("create_tunnel_header: SRC: 0x%x, DST: 0x%x, ttl: %d", 
+            iph->saddr, iph->daddr, iph->ttl);
 	tnl_vport->tnl_ops->build_header(vport, mutable, iph + 1);
 }
 
@@ -953,8 +921,10 @@ static struct tnl_cache *build_cache(struct vport *vport,
 	int cache_len;
 	struct hh_cache *hh;
 
-	if (!(mutable->flags & TNL_F_HDR_CACHE))
+	if (!(mutable->flags & TNL_F_HDR_CACHE)) {
+        pr_warn (" NO CACHE ----> ");
 		return NULL;
+    }
 
 	/*
 	 * If there is no entry in the ARP cache or if this device does not
@@ -1075,7 +1045,7 @@ static struct rtable *__find_route(const struct tnl_mutable_config *mutable,
 		if (OVS_CB(skb)->tun_ipv4_dst)
 			fl.daddr = OVS_CB(skb)->tun_ipv4_dst;
 		if (OVS_CB(skb)->tun_ipv4_src)
-			fl.daddr = OVS_CB(skb)->tun_ipv4_src;
+			fl.saddr = OVS_CB(skb)->tun_ipv4_src;
 	}
 
 	return ip_route_output_key(port_key_get_net(&mutable->key), &fl);
@@ -1089,26 +1059,38 @@ static struct rtable *find_route(struct vport *vport,
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	struct tnl_cache *cur_cache = rcu_dereference(tnl_vport->cache);
+    struct rtable *rt;
 
 	*cache = NULL;
 	tos = RT_TOS(tos);
 
 	if (likely(tos == RT_TOS(mutable->tos) &&
 	    check_cache_valid(cur_cache, mutable))) {
-		*cache = cur_cache;
-		return cur_cache->rt;
-	} else {
-		struct rtable *rt;
+        pr_warn ("%s:%d: PKT DST: 0x%x, CDST: 0x%x",
+                __func__, __LINE__,
+                OVS_CB(skb)->tun_ipv4_dst,
+                cur_cache->rt->rt_dst);
 
-		rt = __find_route(mutable, tnl_vport->tnl_ops->ipproto, tos, skb);
-		if (IS_ERR(rt))
-			return NULL;
+        if (OVS_CB(skb)->tun_ipv4_dst && 
+                cur_cache->rt->rt_dst == OVS_CB(skb)->tun_ipv4_dst) {
+            *cache = cur_cache;
+            return cur_cache->rt;
+        } 
+    }
 
-		if (likely(tos == RT_TOS(mutable->tos)))
-			*cache = build_cache(vport, mutable, rt);
+    rt = __find_route(mutable, tnl_vport->tnl_ops->ipproto, tos, skb);
+    if (IS_ERR(rt))
+        return NULL;
 
-		return rt;
-	}
+    if (likely(tos == RT_TOS(mutable->tos)))
+        *cache = build_cache(vport, mutable, rt);
+
+    pr_warn ("%s:%d: PKT DST: 0x%x, CDST: 0x%x",
+            __func__, __LINE__,
+            OVS_CB(skb)->tun_ipv4_dst,
+            rt->rt_dst);
+
+    return rt;
 }
 
 static bool need_linearize(const struct sk_buff *skb)
@@ -1342,12 +1324,10 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 			memcpy(skb->data, get_cached_header(cache), cache->len);
 			skb_reset_mac_header(skb);
 			skb_set_network_header(skb, cache->hh_len);
-
 		} else {
 			skb_push(skb, mutable->tunnel_hlen);
 			create_tunnel_header(vport, mutable, rt, skb->data);
 			skb_reset_network_header(skb);
-
 			if (next_skb)
 				skb_dst_set(skb, dst_clone(unattached_dst));
 			else {
@@ -1368,7 +1348,16 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 		if (unlikely(!skb))
 			goto next;
 
-		if (likely(cache)) {
+        {
+            struct udphdr *udp = udp_hdr(skb);
+            pr_warn ("%s:%d: skb_len: %d, SRC: 0x%x, DST: 0x%x, IPLEN: %d, "
+                    "SPORT: %d, DPORT: %d, UDPLEN: %d",
+                    __FUNCTION__, __LINE__, skb->len, 
+                    iph->saddr, iph->daddr, ntohs(iph->tot_len),
+                    ntohs(udp->source), ntohs(udp->dest), ntohs(udp->len));
+        }
+
+		if (likely(cache)) { 
 			int orig_len = skb->len - cache->len;
 			struct vport *cache_vport;
 
@@ -1396,8 +1385,10 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 				if (likely(net_xmit_eval(xmit_err) == 0))
 					sent_len += orig_len;
 			}
-		} else
+		} else {
 			sent_len += send_frags(skb, mutable);
+            pr_warn ("Non cached. len=%d", sent_len);
+        }
 
 next:
 		skb = next_skb;

@@ -59,6 +59,13 @@
 		      TNL_F_DF_INHERIT | TNL_F_DF_DEFAULT | TNL_F_PMTUD | \
 		      TNL_F_HDR_CACHE | TNL_F_IPSEC)
 
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
+#define rt_dst(rt) (rt->dst)
+#else
+#define rt_dst(rt) (rt->u.dst)
+#endif
+
 /**
  * struct port_lookup_key - Tunnel port key, used as hash table key.
  * @in_key: Key to match on input, 0 for wildcard.
