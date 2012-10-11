@@ -813,8 +813,6 @@ static void create_tunnel_header(const struct vport *vport,
 	if (!iph->ttl)
 		iph->ttl = ip4_dst_hoplimit(&rt_dst(rt));
 
-    pr_warn ("create_tunnel_header: SRC: 0x%x, DST: 0x%x, ttl: %d", 
-            iph->saddr, iph->daddr, iph->ttl);
 	tnl_vport->tnl_ops->build_header(vport, mutable, iph + 1);
 }
 
@@ -831,7 +829,7 @@ static inline int rt_genid(struct net *net)
 #endif
 
 static bool check_cache_valid(const struct tnl_cache *cache,
-			      const struct tnl_mutable_config *mutable)
+			      const struct tnl_mutable_config *mutable, __be32 daddr)
 {
 	struct hh_cache *hh;
 
@@ -851,7 +849,8 @@ static bool check_cache_valid(const struct tnl_cache *cache,
 #endif
 		mutable->seq == cache->mutable_seq &&
 		(!ovs_is_internal_dev(rt_dst(cache->rt).dev) ||
-		(cache->flow && !cache->flow->dead));
+		(cache->flow && !cache->flow->dead)) && 
+        ((daddr == 0) || (daddr == cache->rt->rt_dst));
 }
 
 static void __cache_cleaner(struct tnl_vport *tnl_vport)
@@ -860,7 +859,7 @@ static void __cache_cleaner(struct tnl_vport *tnl_vport)
 			rcu_dereference(tnl_vport->mutable);
 	const struct tnl_cache *cache = rcu_dereference(tnl_vport->cache);
 
-	if (cache && !check_cache_valid(cache, mutable) &&
+	if (cache && !check_cache_valid(cache, mutable, 0) &&
 	    spin_trylock_bh(&tnl_vport->cache_lock)) {
 		assign_cache_rcu(tnl_vport_to_vport(tnl_vport), NULL);
 		spin_unlock_bh(&tnl_vport->cache_lock);
@@ -913,7 +912,7 @@ static void create_eth_hdr(struct tnl_cache *cache, struct hh_cache *hh)
 
 static struct tnl_cache *build_cache(struct vport *vport,
 				     const struct tnl_mutable_config *mutable,
-				     struct rtable *rt)
+				     struct rtable *rt, __be32 daddr)
 {
 	struct tnl_vport *tnl_vport = tnl_vport_priv(vport);
 	struct tnl_cache *cache;
@@ -922,7 +921,6 @@ static struct tnl_cache *build_cache(struct vport *vport,
 	struct hh_cache *hh;
 
 	if (!(mutable->flags & TNL_F_HDR_CACHE)) {
-        pr_warn (" NO CACHE ----> ");
 		return NULL;
     }
 
@@ -943,8 +941,9 @@ static struct tnl_cache *build_cache(struct vport *vport,
 		return NULL;
 
 	cache = cache_dereference(tnl_vport);
-	if (check_cache_valid(cache, mutable))
+	if (check_cache_valid(cache, mutable, daddr)) {
 		goto unlock;
+    }
 	else
 		cache = NULL;
 
@@ -1065,17 +1064,11 @@ static struct rtable *find_route(struct vport *vport,
 	tos = RT_TOS(tos);
 
 	if (likely(tos == RT_TOS(mutable->tos) &&
-	    check_cache_valid(cur_cache, mutable))) {
-        pr_warn ("%s:%d: PKT DST: 0x%x, CDST: 0x%x",
-                __func__, __LINE__,
-                OVS_CB(skb)->tun_ipv4_dst,
-                cur_cache->rt->rt_dst);
-
-        if (OVS_CB(skb)->tun_ipv4_dst && 
-                cur_cache->rt->rt_dst == OVS_CB(skb)->tun_ipv4_dst) {
-            *cache = cur_cache;
-            return cur_cache->rt;
-        } 
+	    check_cache_valid(cur_cache, mutable, OVS_CB(skb)->tun_ipv4_dst))) {
+        /*if (OVS_CB(skb)->tun_ipv4_dst && 
+                cur_cache->rt->rt_dst == OVS_CB(skb)->tun_ipv4_dst) {*/
+        *cache = cur_cache;
+        return cur_cache->rt;
     }
 
     rt = __find_route(mutable, tnl_vport->tnl_ops->ipproto, tos, skb);
@@ -1083,12 +1076,16 @@ static struct rtable *find_route(struct vport *vport,
         return NULL;
 
     if (likely(tos == RT_TOS(mutable->tos)))
-        *cache = build_cache(vport, mutable, rt);
+        *cache = build_cache(vport, mutable, rt, OVS_CB(skb)->tun_ipv4_dst);
 
-    pr_warn ("%s:%d: PKT DST: 0x%x, CDST: 0x%x",
-            __func__, __LINE__,
-            OVS_CB(skb)->tun_ipv4_dst,
-            rt->rt_dst);
+#if 0
+    if (OVS_CB(skb)->tun_ipv4_dst != rt->rt_dst) {
+        pr_warn ("+++ %s:%d: PKT DST: 0x%x, CDST: 0x%x",
+                __func__, __LINE__,
+                OVS_CB(skb)->tun_ipv4_dst,
+                rt->rt_dst);
+    }
+#endif
 
     return rt;
 }
@@ -1348,15 +1345,6 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 		if (unlikely(!skb))
 			goto next;
 
-        {
-            struct udphdr *udp = udp_hdr(skb);
-            pr_warn ("%s:%d: skb_len: %d, SRC: 0x%x, DST: 0x%x, IPLEN: %d, "
-                    "SPORT: %d, DPORT: %d, UDPLEN: %d",
-                    __FUNCTION__, __LINE__, skb->len, 
-                    iph->saddr, iph->daddr, ntohs(iph->tot_len),
-                    ntohs(udp->source), ntohs(udp->dest), ntohs(udp->len));
-        }
-
 		if (likely(cache)) { 
 			int orig_len = skb->len - cache->len;
 			struct vport *cache_vport;
@@ -1387,7 +1375,6 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 			}
 		} else {
 			sent_len += send_frags(skb, mutable);
-            pr_warn ("Non cached. len=%d", sent_len);
         }
 
 next:
