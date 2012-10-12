@@ -188,41 +188,17 @@ vxlan_vme_get_peer_vtep (struct tnl_vport *vxport, u8 *macaddr)
     return NULL;
 }
 
-static int 
-vxlan_mc_join (struct net * net, __be32 saddr, __be32 daddr)
+static int
+vxlan_open_socket (struct tnl_mutable_config *mutable, 
+                   __be32 addr, u16 port, struct socket **socket,
+                   int *mlink)
 {
     struct net_device *dev;
     struct rtable *rt;
     struct flowi4  fl;
-
-    memset(&fl, 0, sizeof(fl));
-    fl.daddr = daddr;
-    fl.saddr = saddr;
-    fl.flowi4_tos = 0;
-    fl.flowi4_proto = IPPROTO_UDP;
-
-    rt = ip_route_output_key(net, &fl);
-    if (IS_ERR (rt)) {
-        pr_warn ("vxlan_mc_join: Route error. SRC=0x%x, DST=0x%x, rt=%p", 
-                saddr, daddr, rt);
-        return -EHOSTUNREACH;
-    }
-
-    dev = rt_dst(rt).dev;
-    ip_rt_put(rt);
-    if (__in_dev_get_rtnl(dev) == NULL)
-        return -EADDRNOTAVAIL;
-    ip_mc_inc_group(__in_dev_get_rtnl(dev), daddr);
-
-    return 0;
-}
-
-static int
-vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
-{
-	struct sockaddr_in sin;
+    struct sockaddr_in sin;
     struct sock * sk;
-	int err;
+    int err;
 
 	err = sock_create(AF_INET, SOCK_DGRAM, 0, socket);
 	if (err) {
@@ -237,7 +213,7 @@ vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
                       sizeof(struct sockaddr_in));
 	if (err) {
         pr_warn ("Failed to bind socket for: 0x%x:%d, err=%d", addr, port, err);
-		goto error_sock;
+		goto error;
     }
 
     sk = (*socket)->sk;
@@ -247,17 +223,36 @@ vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
         udp_sk(sk)->encap_rcv = vxlan_rcv;
     }
     else {
-        udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
-        err = vxlan_mc_join (sock_net(sk), 0, addr);
-        if (err < 0) {
-            pr_warn("Failed to set multicast socket option --> %d", err);
-            goto error_sock;
+
+        memset(&fl, 0, sizeof(fl));
+        fl.daddr = addr;
+        fl.saddr = mutable->vtep;
+        fl.flowi4_tos = 0;
+        fl.flowi4_proto = IPPROTO_UDP;
+
+        rt = ip_route_output_key(sock_net(sk), &fl);
+        if (IS_ERR (rt)) {
+            pr_warn ("vxlan_mc_join: Route error. SRC=0x%x, DST=0x%x, rt=%p", 
+                    mutable->vtep, addr, rt);
+            err = -EHOSTUNREACH;
+            goto error;
         }
+
+        dev = rt_dst(rt).dev;
+        ip_rt_put(rt);
+        if (__in_dev_get_rtnl(dev) == NULL) {
+            err = -EADDRNOTAVAIL;
+            goto error;
+        }
+
+        udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
+        *mlink = dev->ifindex;
+        ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
     }
 
     return 0;
 
- error_sock:
+ error:
 	sock_release(*socket);
     *socket = NULL;
     return err;
@@ -265,7 +260,7 @@ vxlan_open_socket (__be32  addr, u16 port, struct socket **socket)
 
 
 static void
-vxlan_close_socket (struct socket *socket)
+vxlan_close_socket (struct tnl_mutable_config *mutable, struct socket *socket)
 {
     __be32 saddr;
 
@@ -273,9 +268,13 @@ vxlan_close_socket (struct socket *socket)
         return;
     
     saddr = inet_sk(socket->sk)->inet_rcv_saddr;
-    if (ipv4_is_multicast(saddr) == true) {
+    if ((ipv4_is_multicast(saddr) == true) && (mutable->mlink)) {
+        struct in_device *in_dev;
+        in_dev = inetdev_by_index(port_key_get_net(&mutable->key), 
+                                     mutable->mlink);
+		if (in_dev)
+			ip_mc_dec_group(in_dev, mutable->key.daddr);
     }
-
     sock_release (socket);
 }
 
@@ -369,13 +368,15 @@ vxlan_destroy(struct vport *vport)
     struct vxlan_mac_entry        *vme;
     struct hlist_node             *node;
     struct hlist_head             *bucket;
+    struct tnl_mutable_config     *mutable;
     int                            i;
 
 	vxport = tnl_vport_priv(vport);
+    mutable = rtnl_dereference(vxport->mutable);
     rcv_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
-    vxlan_close_socket (rcv_socket);
+    vxlan_close_socket (mutable, rcv_socket);
     mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
-    vxlan_close_socket (mcast_socket);
+    vxlan_close_socket (mutable, mcast_socket);
 
     mac_table = rtnl_dereference(vxport->vxlan_mac_table);
     for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++) {
@@ -463,7 +464,7 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 	struct tnl_vport                 *vxport;
     struct socket                      *rcv_socket, *old_rcv_socket;
     struct socket                      *mcast_socket, *old_mcast_socket;
-	int                                 err;
+	int                                 err, mlink;
 
     rcv_socket = old_rcv_socket = old_mcast_socket = NULL;
     
@@ -488,8 +489,8 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
     mutable->key.in_key = cpu_to_be64(mutable->vni);
     mutable->key.tunnel_type = (TNL_T_PROTO_VXLAN | TNL_T_KEY_EXACT);
 
-    /* XXX if (mutable->flags & TNL_F_IPSEC)
-        mutable->key.tunnel_type |= TNL_T_IPSEC;*/
+    if (mutable->flags & TNL_F_IPSEC)
+        mutable->key.tunnel_type |= TNL_T_IPSEC;
     
     /* Let's check if we already have an interface persent with same VNI */
     if (mutable->vni != old_mutable->vni) {
@@ -505,33 +506,34 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 
     if ((mutable->vtep != old_mutable->vtep) ||
         (mutable->vtep_port != old_mutable->vtep_port)) {
-        err = vxlan_open_socket (mutable->vtep, mutable->vtep_port,
-                                   &rcv_socket);
+        err = vxlan_open_socket (mutable, mutable->vtep, mutable->vtep_port,
+                                   &rcv_socket, &mlink);
         if (err != 0) {
             goto error;
         }
         old_rcv_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
         rcu_assign_pointer(vxport->vxlan_rcv_socket, rcv_socket);
-        vxlan_close_socket (old_rcv_socket);
+        vxlan_close_socket (mutable, old_rcv_socket);
     }
 
     if ((mutable->mcast_ip != old_mutable->mcast_ip) ||
         (mutable->mcast_port != old_mutable->mcast_port)) {
-        err = vxlan_open_socket (mutable->mcast_ip, mutable->mcast_port,
-                                   &mcast_socket);
+        err = vxlan_open_socket (mutable, mutable->mcast_ip, 
+                                 mutable->mcast_port, &mcast_socket, &mlink);
         if (err != 0) {
             goto sock_free;
         }
 
         old_mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
         rcu_assign_pointer(vxport->vxlan_mcast_socket, mcast_socket);
-        vxlan_close_socket(old_mcast_socket);
+        vxlan_close_socket(mutable, old_mcast_socket);
+        mutable->mlink = mlink;
     }
 
 	return 0;
     
  sock_free:
-    vxlan_close_socket (rcv_socket);
+    vxlan_close_socket (mutable, rcv_socket);
  error:
 	return err;
 }
@@ -631,7 +633,7 @@ vxlan_build_header(const struct vport *vport,
 	struct udphdr *udph = header;
 	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
 
-	udph->dest = htons(mutable->vtep_port);
+	//udph->dest = htons(mutable->vtep_port);
 	udph->check = 0;
 
 	vxh->vx_flags = htonl(VXLAN_FLAGS);
@@ -650,6 +652,7 @@ vxlan_update_header(const struct vport *vport,
 		vxh->vx_vni = htonl(mutable->vni);
 
 	udph->source = htons(mutable->vtep_port); 
+	udph->dest = htons(OVS_CB(skb)->vxlan_udp_port);
 	udph->len = htons(skb->len - skb_transport_offset(skb));
 
 	/*
@@ -731,6 +734,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
     OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
     if (vme) {
         OVS_CB(skb)->tun_ipv4_dst = vme->peer;
+        OVS_CB(skb)->vxlan_udp_port = mutable->vtep_port;
     }
     else if (mutable->mcast_ip) {
         /* 
@@ -738,6 +742,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
          * where we want to do the multicast.
          */
         OVS_CB(skb)->tun_ipv4_dst = mutable->mcast_ip;
+        OVS_CB(skb)->vxlan_udp_port = mutable->mcast_port;
     }
     else {
         goto error;
