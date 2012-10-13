@@ -35,7 +35,7 @@
 #define VXPORT_TABLE_SIZE  (1024)
 #define VXLAN_MAC_TABLE_SIZE  (1024)
 
-//#define OVS_VXLAN_DEBUG_ENABLE
+#define OVS_VXLAN_DEBUG_ENABLE
 #ifdef OVS_VXLAN_DEBUG_ENABLE
 #define OVS_VXLAN_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
@@ -202,7 +202,7 @@ vxlan_open_socket (struct tnl_mutable_config *mutable,
 
 	err = sock_create(AF_INET, SOCK_DGRAM, 0, socket);
 	if (err) {
-        pr_warn ("Failed to create socket for: 0x%x:%d", addr, port);
+        pr_warn ("vxlan: Failed to create socket for: 0x%x:%d", addr, port);
         return err;
     }
 
@@ -212,7 +212,8 @@ vxlan_open_socket (struct tnl_mutable_config *mutable,
 	err = kernel_bind(*socket, (struct sockaddr *)&sin,
                       sizeof(struct sockaddr_in));
 	if (err) {
-        pr_warn ("Failed to bind socket for: 0x%x:%d, err=%d", addr, port, err);
+        pr_warn ("vxlan: Failed to bind socket for: 0x%x:%d, err=%d", 
+                addr, port, err);
 		goto error;
     }
 
@@ -223,7 +224,6 @@ vxlan_open_socket (struct tnl_mutable_config *mutable,
         udp_sk(sk)->encap_rcv = vxlan_rcv;
     }
     else {
-
         memset(&fl, 0, sizeof(fl));
         fl.daddr = addr;
         fl.saddr = mutable->vtep;
@@ -232,7 +232,7 @@ vxlan_open_socket (struct tnl_mutable_config *mutable,
 
         rt = ip_route_output_key(sock_net(sk), &fl);
         if (IS_ERR (rt)) {
-            pr_warn ("vxlan_mc_join: Route error. SRC=0x%x, DST=0x%x, rt=%p", 
+            pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
                     mutable->vtep, addr, rt);
             err = -EHOSTUNREACH;
             goto error;
@@ -396,10 +396,9 @@ static const struct nla_policy vxlan_nl_policy[OVS_TUNNEL_ATTR_MAX + 1] = {
 	[OVS_TUNNEL_ATTR_TTL]          = { .type = NLA_U8 },
 
 	[OVS_TUNNEL_ATTR_SRC_IPV4]     = { .type = NLA_U32 },
+    [OVS_TUNNEL_ATTR_DST_IPV4]     = { .type = NLA_U32 },
 	[OVS_TUNNEL_ATTR_VTEP_PORT]    = { .type = NLA_U16 },
     [OVS_TUNNEL_ATTR_IN_KEY]       = { .type = NLA_U64 },
-    [OVS_TUNNEL_ATTR_OUT_KEY]      = { .type = NLA_U64 },
-    [OVS_TUNNEL_ATTR_DST_IPV4]     = { .type = NLA_U32 },
     [OVS_TUNNEL_ATTR_MCAST_PORT]   = { .type = NLA_U16 },
 };
 
@@ -605,9 +604,6 @@ vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
 		goto nla_put_failure;
 
 	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_IN_KEY, cpu_to_be64(mutable->vni)))
-		goto nla_put_failure;
-
-	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_OUT_KEY, cpu_to_be64(mutable->vni)))
 		goto nla_put_failure;
 
 	if (nla_put_be32(skb, OVS_TUNNEL_ATTR_DST_IPV4, mutable->mcast_ip))

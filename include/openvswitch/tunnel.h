@@ -58,10 +58,7 @@ enum {
 	OVS_TUNNEL_ATTR_TOS,        /* 8-bit TOS value. */
 	OVS_TUNNEL_ATTR_TTL,        /* 8-bit TTL value. */
 
-	//OVS_TUNNEL_ATTR_VTEP,       /* IPv4 VXLAN source address. */
 	OVS_TUNNEL_ATTR_VTEP_PORT,  /* VTEP UDP port to bind on. */
-    //OVS_TUNNEL_ATTR_VNI,        /* VXLAN segment id */
-    //OVS_TUNNEL_ATTR_MCAST_IP,   /* Mulitcast IP for broadcast messages */
     OVS_TUNNEL_ATTR_MCAST_PORT, /* Mulitcast UDP port for broadcast messages */
 
 	__OVS_TUNNEL_ATTR_MAX

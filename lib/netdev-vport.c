@@ -584,6 +584,72 @@ set_key(const struct smap *args, const char *name, uint16_t type,
     }
 }
 
+static bool
+parse_tunnel_config_flags (const char *name, struct smap_node *node, 
+                            uint32_t *flags, struct ofpbuf *options,
+                            bool supports_csum)
+{
+    if (!strcmp(node->key, "tos")) {
+        if (!strcmp(node->value, "inherit")) {
+            *flags |= TNL_F_TOS_INHERIT;
+        } else {
+            char *endptr;
+            int tos;
+            tos = strtol(node->value, &endptr, 0);
+            if (*endptr == '\0' && tos == (tos & IP_DSCP_MASK)) {
+                nl_msg_put_u8(options, OVS_TUNNEL_ATTR_TOS, tos);
+            } else {
+                VLOG_WARN("%s: invalid TOS %s", name, node->value);
+            }
+        }
+        return true;
+    } 
+    
+    if (!strcmp(node->key, "ttl")) {
+        if (!strcmp(node->value, "inherit")) {
+            *flags |= TNL_F_TTL_INHERIT;
+        } else {
+            nl_msg_put_u8(options, OVS_TUNNEL_ATTR_TTL, atoi(node->value));
+        }
+        return true;
+    } 
+    
+    if (!strcmp(node->key, "csum") && supports_csum) {
+        if (!strcmp(node->value, "true")) {
+            *flags |= TNL_F_CSUM;
+        }
+        return true;
+    } 
+    
+    if (!strcmp(node->key, "df_inherit")) {
+        if (!strcmp(node->value, "true")) {
+            *flags |= TNL_F_DF_INHERIT;
+        }
+        return true;
+    } 
+
+    if (!strcmp(node->key, "df_default")) {
+        if (!strcmp(node->value, "false")) {
+            *flags &= ~TNL_F_DF_DEFAULT;
+        }
+        return true;
+    } 
+    if (!strcmp(node->key, "pmtud")) {
+        if (!strcmp(node->value, "false")) {
+            *flags &= ~TNL_F_PMTUD;
+        }
+        return true;
+    } 
+    if (!strcmp(node->key, "header_cache")) {
+        if (!strcmp(node->value, "false")) {
+            *flags &= ~TNL_F_HDR_CACHE;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static int
 parse_tunnel_config(const char *name, const char *type,
                     const struct smap *args, struct ofpbuf *options)
@@ -595,9 +661,6 @@ parse_tunnel_config(const char *name, const char *type,
     ovs_be32 daddr = htonl(0);
     ovs_be32 saddr = htonl(0);
     uint32_t flags;
-    ovs_be32 vtep = 0;
-    ovs_be32 vxlan_mcast_ip = 0;
-    uint64_t vni = 0;
 
     supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
     is_ipsec = !strncmp(type, "ipsec_", 6);
@@ -609,6 +672,11 @@ parse_tunnel_config(const char *name, const char *type,
     }
 
     SMAP_FOR_EACH (node, args) {
+        if (parse_tunnel_config_flags (name, node, &flags, options, 
+                    supports_csum) == true) {
+            continue;
+        }
+
         if (!strcmp(node->key, "remote_ip")) {
             struct in_addr in_addr;
             if (lookup_ip(node->value, &in_addr)) {
@@ -622,45 +690,6 @@ parse_tunnel_config(const char *name, const char *type,
                 VLOG_WARN("%s: bad %s 'local_ip'", name, type);
             } else {
                 saddr = in_addr.s_addr;
-            }
-        } else if (!strcmp(node->key, "tos")) {
-            if (!strcmp(node->value, "inherit")) {
-                flags |= TNL_F_TOS_INHERIT;
-            } else {
-                char *endptr;
-                int tos;
-                tos = strtol(node->value, &endptr, 0);
-                if (*endptr == '\0' && tos == (tos & IP_DSCP_MASK)) {
-                    nl_msg_put_u8(options, OVS_TUNNEL_ATTR_TOS, tos);
-                } else {
-                    VLOG_WARN("%s: invalid TOS %s", name, node->value);
-                }
-            }
-        } else if (!strcmp(node->key, "ttl")) {
-            if (!strcmp(node->value, "inherit")) {
-                flags |= TNL_F_TTL_INHERIT;
-            } else {
-                nl_msg_put_u8(options, OVS_TUNNEL_ATTR_TTL, atoi(node->value));
-            }
-        } else if (!strcmp(node->key, "csum") && supports_csum) {
-            if (!strcmp(node->value, "true")) {
-                flags |= TNL_F_CSUM;
-            }
-        } else if (!strcmp(node->key, "df_inherit")) {
-            if (!strcmp(node->value, "true")) {
-                flags |= TNL_F_DF_INHERIT;
-            }
-        } else if (!strcmp(node->key, "df_default")) {
-            if (!strcmp(node->value, "false")) {
-                flags &= ~TNL_F_DF_DEFAULT;
-            }
-        } else if (!strcmp(node->key, "pmtud")) {
-            if (!strcmp(node->value, "false")) {
-                flags &= ~TNL_F_PMTUD;
-            }
-        } else if (!strcmp(node->key, "header_cache")) {
-            if (!strcmp(node->value, "false")) {
-                flags &= ~TNL_F_HDR_CACHE;
             }
         } else if (!strcmp(node->key, "peer_cert") && is_ipsec) {
             if (smap_get(args, "certificate")) {
@@ -693,38 +722,6 @@ parse_tunnel_config(const char *name, const char *type,
                    !strcmp(node->key, "in_key") ||
                    !strcmp(node->key, "out_key")) {
             /* Handled separately below. */
-        } else if (strcmp(node->key, "vtep") == 0) {
-            struct in_addr in_addr;
-            if (lookup_ip(node->value, &in_addr)) {
-                VLOG_WARN("%s: bad %s 'ip'", node->key, type);
-            } else
-                vtep = in_addr.s_addr;
-        } else if (strcmp(node->key, "vni") == 0) {
-            vni = strtoull(node->value, NULL, 0);
-            if (vni > 0xFFFFFF) {
-                VLOG_WARN("bad VNI. Can't be more than "
-                          "16777215(0xFFFFFF). %llu", (uint64_t)vni);
-                return EINVAL;
-            } 
-        } else if (strcmp(node->key, "vxlan_udp_port") == 0) {
-            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_VTEP_PORT,
-                           atoi(node->value));
-        } else if (strcmp(node->key, "vxlan_mcast_ip") == 0) {
-            struct in_addr in_addr;
-            if (lookup_ip(node->value, &in_addr)) {
-                VLOG_WARN("%s: bad %s 'ip'", node->key, node->value);
-            } else {
-                if (ip_is_multicast(in_addr.s_addr)) {
-                    vxlan_mcast_ip = in_addr.s_addr;
-                }
-                else {
-                    VLOG_WARN("%s: bad %s 'multicast ip'",
-                              node->key, node->value);
-                }
-            }
-        } else if (strcmp(node->key, "vxlan_mcast_port") == 0) {
-            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_MCAST_PORT,
-                           atoi(node->value));
         } else {
             VLOG_WARN("%s: unknown %s argument '%s'", name, type, node->key);
         }
@@ -757,44 +754,22 @@ parse_tunnel_config(const char *name, const char *type,
         }
     }
 
-    if (strcmp (type, "vxlan") == 0) {
-        if (vtep != 0 && vni != 0 && vxlan_mcast_ip != 0) {
-            __be64  nvni = htonll(vni);
-            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, vtep);
-            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, vxlan_mcast_ip);
+    set_key(args, "in_key", OVS_TUNNEL_ATTR_IN_KEY, options);
+    set_key(args, "out_key", OVS_TUNNEL_ATTR_OUT_KEY, options);
 
-            nl_msg_put_be64(options, OVS_TUNNEL_ATTR_IN_KEY, nvni);
-            nl_msg_put_be64(options, OVS_TUNNEL_ATTR_OUT_KEY, nvni);
-            VLOG_ERR("VNI: 0x%llx, VTEP: 0x%x, mcast_ip: 0x%x",
-                     nvni, vtep, vxlan_mcast_ip);
-        }
-        else {
-            VLOG_ERR("Configure options, VNI, VTEP, VXLAN MULTICAST IP. "
-                     "MISSING: %s %s %s",
-                     (vni != 0) ? "VNI " : " ",
-                     (vtep != 0) ? "VTEP " : " ",
-                     (vxlan_mcast_ip != 0) ? "VXLAN MULTICAST IP" : " ");
-            return EINVAL;
-        }
+    if (!daddr) {
+        VLOG_ERR("%s: %s type requires valid 'remote_ip' argument",
+                name, type);
+        return EINVAL;
     }
-    else {
-        set_key(args, "in_key", OVS_TUNNEL_ATTR_IN_KEY, options);
-        set_key(args, "out_key", OVS_TUNNEL_ATTR_OUT_KEY, options);
-
-        if (!daddr) {
-            VLOG_ERR("%s: %s type requires valid 'remote_ip' argument",
-                     name, type);
-            return EINVAL;
-        }
-        nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, daddr);
+    nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, daddr);
         
-        if (saddr) {
-            if (ip_is_multicast(daddr)) {
-                VLOG_WARN("%s: remote_ip is multicast, ignoring local_ip",
-                          name);
-            } else {
-                nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, saddr);
-            }
+    if (saddr) {
+        if (ip_is_multicast(daddr)) {
+            VLOG_WARN("%s: remote_ip is multicast, ignoring local_ip",
+                    name);
+        } else {
+            nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, saddr);
         }
     }
 
@@ -815,8 +790,6 @@ tnl_port_config_from_nlattr(const struct nlattr *options, size_t options_len,
         [OVS_TUNNEL_ATTR_OUT_KEY] = { .type = NL_A_BE64, .optional = true },
         [OVS_TUNNEL_ATTR_TOS] = { .type = NL_A_U8, .optional = true },
         [OVS_TUNNEL_ATTR_TTL] = { .type = NL_A_U8, .optional = true },
-        [OVS_TUNNEL_ATTR_VTEP_PORT] = { .type = NL_A_U16, .optional=true },
-        [OVS_TUNNEL_ATTR_MCAST_PORT] = { .type = NL_A_U16, .optional=true },
     };
     struct ofpbuf buf;
 
@@ -834,6 +807,52 @@ get_be64_or_zero(const struct nlattr *a)
     return a ? ntohll(nl_attr_get_be64(a)) : 0;
 }
 
+
+static void
+unparse_tunnel_config_flags_ttl_tos (struct smap *args, 
+                                     struct nlattr *a[])
+{
+    uint32_t flags;
+
+    flags = nl_attr_get_u32(a[OVS_TUNNEL_ATTR_FLAGS]);
+
+    if (!(flags & TNL_F_HDR_CACHE) == !(flags & TNL_F_IPSEC)) {
+        smap_add(args, "header_cache",
+                 flags & TNL_F_HDR_CACHE ? "true" : "false");
+    }
+    if (!(flags & TNL_F_HDR_CACHE) == !(flags & TNL_F_IPSEC)) {
+        smap_add(args, "header_cache",
+                 flags & TNL_F_HDR_CACHE ? "true" : "false");
+    }
+
+    if (flags & TNL_F_TTL_INHERIT) {
+        smap_add(args, "tos", "inherit");
+    } else if (a[OVS_TUNNEL_ATTR_TTL]) {
+        int ttl = nl_attr_get_u8(a[OVS_TUNNEL_ATTR_TTL]);
+        smap_add_format(args, "tos", "%d", ttl);
+    }
+
+    if (flags & TNL_F_TOS_INHERIT) {
+        smap_add(args, "tos", "inherit");
+    } else if (a[OVS_TUNNEL_ATTR_TOS]) {
+        int tos = nl_attr_get_u8(a[OVS_TUNNEL_ATTR_TOS]);
+        smap_add_format(args, "tos", "0x%x", tos);
+    }
+
+    if (flags & TNL_F_CSUM) {
+        smap_add(args, "csum", "true");
+    }
+    if (flags & TNL_F_DF_INHERIT) {
+        smap_add(args, "df_inherit", "true");
+    }
+    if (!(flags & TNL_F_DF_DEFAULT)) {
+        smap_add(args, "df_default", "false");
+    }
+    if (!(flags & TNL_F_PMTUD)) {
+        smap_add(args, "pmtud", "false");
+    }
+}
+
 static int
 unparse_tunnel_config(const char *name OVS_UNUSED, const char *type OVS_UNUSED,
                       const struct nlattr *options, size_t options_len,
@@ -841,18 +860,11 @@ unparse_tunnel_config(const char *name OVS_UNUSED, const char *type OVS_UNUSED,
 {
     struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1];
     ovs_be32 daddr;
-    uint32_t flags;
     int error;
 
     error = tnl_port_config_from_nlattr(options, options_len, a);
     if (error) {
         return error;
-    }
-
-    flags = nl_attr_get_u32(a[OVS_TUNNEL_ATTR_FLAGS]);
-    if (!(flags & TNL_F_HDR_CACHE) == !(flags & TNL_F_IPSEC)) {
-        smap_add(args, "header_cache",
-                 flags & TNL_F_HDR_CACHE ? "true" : "false");
     }
 
     daddr = nl_attr_get_be32(a[OVS_TUNNEL_ATTR_DST_IPV4]);
@@ -886,32 +898,7 @@ unparse_tunnel_config(const char *name OVS_UNUSED, const char *type OVS_UNUSED,
         }
     }
 
-    if (flags & TNL_F_TTL_INHERIT) {
-        smap_add(args, "tos", "inherit");
-    } else if (a[OVS_TUNNEL_ATTR_TTL]) {
-        int ttl = nl_attr_get_u8(a[OVS_TUNNEL_ATTR_TTL]);
-        smap_add_format(args, "tos", "%d", ttl);
-    }
-
-    if (flags & TNL_F_TOS_INHERIT) {
-        smap_add(args, "tos", "inherit");
-    } else if (a[OVS_TUNNEL_ATTR_TOS]) {
-        int tos = nl_attr_get_u8(a[OVS_TUNNEL_ATTR_TOS]);
-        smap_add_format(args, "tos", "0x%x", tos);
-    }
-
-    if (flags & TNL_F_CSUM) {
-        smap_add(args, "csum", "true");
-    }
-    if (flags & TNL_F_DF_INHERIT) {
-        smap_add(args, "df_inherit", "true");
-    }
-    if (!(flags & TNL_F_DF_DEFAULT)) {
-        smap_add(args, "df_default", "false");
-    }
-    if (!(flags & TNL_F_PMTUD)) {
-        smap_add(args, "pmtud", "false");
-    }
+    unparse_tunnel_config_flags_ttl_tos(args, a);
 
     return 0;
 }
@@ -971,6 +958,222 @@ unparse_patch_config(const char *name OVS_UNUSED, const char *type OVS_UNUSED,
     smap_add(args, "peer", nl_attr_get_string(a[OVS_PATCH_ATTR_PEER]));
     return 0;
 }
+
+
+static int
+parse_vxlan_tunnel_config(const char *name, const char *type,
+                    const struct smap *args, struct ofpbuf *options)
+{
+    bool is_ipsec;
+    bool supports_csum;
+    struct smap_node *node;
+    bool ipsec_mech_set = false;
+    uint32_t flags;
+    ovs_be32 vtep = htonl(0);
+    ovs_be32 mcast_ip = htonl(0);
+    uint64_t vni = 0;
+
+    supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
+    is_ipsec = !strncmp(type, "ipsec_", 6);
+
+    flags = TNL_F_DF_DEFAULT | TNL_F_PMTUD | TNL_F_HDR_CACHE;
+    if (is_ipsec) {
+        flags |= TNL_F_IPSEC;
+        flags &= ~TNL_F_HDR_CACHE;
+    }
+
+    SMAP_FOR_EACH (node, args) {
+        bool flags_cfg = parse_tunnel_config_flags(name, node, &flags, 
+                                     options, supports_csum);
+        if (flags_cfg == true) {
+            continue;
+        }
+
+        if (strcmp(node->key, "vtep") == 0) {
+            struct in_addr in_addr;
+            if (lookup_ip(node->value, &in_addr)) {
+                VLOG_WARN("%s: bad %s 'ip'", node->key, type);
+            } else
+                vtep = in_addr.s_addr;
+        } else if (strcmp(node->key, "vni") == 0) {
+            vni = strtoull(node->value, NULL, 0);
+            if (vni > 0xFFFFFF) {
+                VLOG_WARN("bad VNI. Can't be more than "
+                        "16777215(0xFFFFFF). %llu", (uint64_t)vni);
+                return EINVAL;
+            } 
+        } else if (strcmp(node->key, "vtep_udp_port") == 0) {
+            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_VTEP_PORT,
+                    atoi(node->value));
+        } else if (strcmp(node->key, "mcast_ip") == 0) {
+            struct in_addr in_addr;
+            if (lookup_ip(node->value, &in_addr)) {
+                VLOG_WARN("%s: bad %s 'ip'", node->key, node->value);
+            } else {
+                if (ip_is_multicast(in_addr.s_addr)) {
+                    mcast_ip = in_addr.s_addr;
+                }
+                else {
+                    VLOG_WARN("%s: bad %s 'multicast ip'",
+                            node->key, node->value);
+                }
+            }
+        } else if (strcmp(node->key, "mcast_udp_port") == 0) {
+            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_MCAST_PORT,
+                    atoi(node->value));
+
+        } else if (!strcmp(node->key, "peer_cert") && is_ipsec) {
+            if (smap_get(args, "certificate")) {
+                ipsec_mech_set = true;
+            } else {
+                const char *use_ssl_cert;
+
+                /* If the "use_ssl_cert" is true, then "certificate" and
+                 * "private_key" will be pulled from the SSL table.  The
+                 * use of this option is strongly discouraged, since it
+                 * will like be removed when multiple SSL configurations
+                 * are supported by OVS.
+                 */
+                use_ssl_cert = smap_get(args, "use_ssl_cert");
+                if (!use_ssl_cert || strcmp(use_ssl_cert, "true")) {
+                    VLOG_ERR("%s: 'peer_cert' requires 'certificate' argument",
+                            name);
+                    return EINVAL;
+                }
+                ipsec_mech_set = true;
+            }
+        } else if (!strcmp(node->key, "psk") && is_ipsec) {
+            ipsec_mech_set = true;
+        } else if (is_ipsec
+                && (!strcmp(node->key, "certificate")
+                    || !strcmp(node->key, "private_key")
+                    || !strcmp(node->key, "use_ssl_cert"))) {
+            /* Ignore options not used by the netdev. */
+        } else {
+            VLOG_WARN("%s: unknown %s argument '%s'", name, type, node->key);
+        }
+    }
+
+    if (is_ipsec) {
+        static pid_t pid = 0;
+        if (pid <= 0) {
+            char *file_name = xasprintf("%s/%s", ovs_rundir(),
+                                        "ovs-monitor-ipsec.pid");
+            pid = read_pidfile(file_name);
+            free(file_name);
+        }
+
+        if (pid < 0) {
+            VLOG_ERR("%s: IPsec requires the ovs-monitor-ipsec daemon",
+                     name);
+            return EINVAL;
+        }
+
+        if (smap_get(args, "peer_cert") && smap_get(args, "psk")) {
+            VLOG_ERR("%s: cannot define both 'peer_cert' and 'psk'", name);
+            return EINVAL;
+        }
+
+        if (!ipsec_mech_set) {
+            VLOG_ERR("%s: IPsec requires an 'peer_cert' or psk' argument",
+                     name);
+            return EINVAL;
+        }
+    }
+
+    if (vtep != 0 && vni != 0 && mcast_ip != 0) {
+        __be64  nvni = htonll(vni);
+        nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, vtep);
+        nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, mcast_ip);
+        nl_msg_put_be64(options, OVS_TUNNEL_ATTR_IN_KEY, nvni);
+
+        VLOG_INFO("VNI: 0x%llx, VTEP: 0x%x, mcast_ip: 0x%x",
+                nvni, vtep, mcast_ip);
+    }
+    else {
+        VLOG_ERR("Configure options: VNI, VTEP, MULTICAST IP. "
+                "MISSING: %s %s %s",
+                (vni != 0) ? "VNI " : " ",
+                (vtep != 0) ? "VTEP " : " ",
+                (mcast_ip != 0) ? "VXLAN MULTICAST IP" : " ");
+        return EINVAL;
+    }
+
+    nl_msg_put_u32(options, OVS_TUNNEL_ATTR_FLAGS, flags);
+
+    return 0;
+}
+
+static int
+tnl_vxlan_port_config_from_nlattr(const struct nlattr *options, 
+        size_t options_len, struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1])
+{
+    static const struct nl_policy ovs_tunnel_policy[] = {
+        [OVS_TUNNEL_ATTR_FLAGS] = { .type = NL_A_U32 },
+        [OVS_TUNNEL_ATTR_SRC_IPV4] = { .type = NL_A_BE32 },
+        [OVS_TUNNEL_ATTR_DST_IPV4] = { .type = NL_A_BE32, .optional = true },
+        [OVS_TUNNEL_ATTR_IN_KEY] = { .type = NL_A_BE64 },
+        [OVS_TUNNEL_ATTR_TOS] = { .type = NL_A_U8, .optional = true },
+        [OVS_TUNNEL_ATTR_TTL] = { .type = NL_A_U8, .optional = true },
+        [OVS_TUNNEL_ATTR_VTEP_PORT] = { .type = NL_A_U16, .optional=true },
+        [OVS_TUNNEL_ATTR_MCAST_PORT] = { .type = NL_A_U16, .optional=true },
+    };
+    struct ofpbuf buf;
+
+    ofpbuf_use_const(&buf, options, options_len);
+    if (!nl_policy_parse(&buf, 0, ovs_tunnel_policy,
+                         a, ARRAY_SIZE(ovs_tunnel_policy))) {
+        return EINVAL;
+    }
+
+    return 0;
+}
+
+static int
+unparse_vxlan_tunnel_config(const char *name OVS_UNUSED, 
+                            const char *type OVS_UNUSED,
+                            const struct nlattr *options, 
+                            size_t options_len,
+                            struct smap *args)
+{
+    struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1];
+    ovs_be32 addr;
+    uint64_t in_key;
+    uint16_t port;
+    int error;
+
+    error = tnl_vxlan_port_config_from_nlattr(options, options_len, a);
+    if (error) {
+        return error;
+    }
+
+    addr = nl_attr_get_be32(a[OVS_TUNNEL_ATTR_SRC_IPV4]);
+    smap_add_format(args, "vtep", IP_FMT, IP_ARGS(&addr));
+
+    in_key = get_be64_or_zero(a[OVS_TUNNEL_ATTR_IN_KEY]);
+    smap_add_format(args, "vni", "%"PRIu64, in_key);
+
+    if (a[OVS_TUNNEL_ATTR_DST_IPV4]) {
+        addr = nl_attr_get_be32(a[OVS_TUNNEL_ATTR_DST_IPV4]);
+        smap_add_format(args, "mcast_ip", IP_FMT, IP_ARGS(&addr));
+    }
+
+    if (a[OVS_TUNNEL_ATTR_VTEP_PORT]) {
+        port = nl_attr_get_u16(a[OVS_TUNNEL_ATTR_VTEP_PORT]);
+        smap_add_format(args, "vtep_udp_port", "%d", port);
+    }
+
+    if (a[OVS_TUNNEL_ATTR_MCAST_PORT]) {
+        port = nl_attr_get_u16(a[OVS_TUNNEL_ATTR_MCAST_PORT]);
+        smap_add_format(args, "mcast_udp_port", "%d", port);
+    }
+    
+    unparse_tunnel_config_flags_ttl_tos(args, a);
+
+    return 0;
+}
+
+
 
 #define VPORT_FUNCTIONS(GET_STATUS)                         \
     NULL,                                                   \
@@ -1049,11 +1252,11 @@ netdev_vport_register(void)
 
         { OVS_VPORT_TYPE_VXLAN,
           { "vxlan", VPORT_FUNCTIONS(netdev_vport_get_drv_info) },
-          parse_tunnel_config, unparse_tunnel_config },
+          parse_vxlan_tunnel_config, unparse_vxlan_tunnel_config },
 
         { OVS_VPORT_TYPE_VXLAN,
           { "vxlan_ipsec", VPORT_FUNCTIONS(netdev_vport_get_drv_info) },
-          parse_tunnel_config, unparse_tunnel_config },
+          parse_vxlan_tunnel_config, unparse_vxlan_tunnel_config },
 
         { OVS_VPORT_TYPE_PATCH,
           { "patch", VPORT_FUNCTIONS(NULL) },
