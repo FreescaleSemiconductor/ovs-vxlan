@@ -59,6 +59,7 @@
 #include "vlan.h"
 #include "tunnel.h"
 #include "vport-internal_dev.h"
+#include "vport-vxlan.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,18) || \
     LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
@@ -2213,9 +2214,13 @@ static int __init dp_init(void)
 	if (err)
 		goto error_flow_exit;
 
+    err = ovs_vxlan_init ();
+    if (err)
+        goto error_vport_exit;
+
 	err = register_pernet_device(&ovs_net_ops);
 	if (err)
-		goto error_vport_exit;
+		goto error_vxlan_exit;
 
 	err = register_netdevice_notifier(&ovs_dp_device_notifier);
 	if (err)
@@ -2233,6 +2238,8 @@ error_unreg_notifier:
 	unregister_netdevice_notifier(&ovs_dp_device_notifier);
 error_netns_exit:
 	unregister_pernet_device(&ovs_net_ops);
+error_vxlan_exit:
+    ovs_vxlan_exit();
 error_vport_exit:
 	ovs_vport_exit();
 error_flow_exit:
@@ -2254,6 +2261,7 @@ static void dp_cleanup(void)
 	unregister_netdevice_notifier(&ovs_dp_device_notifier);
 	unregister_pernet_device(&ovs_net_ops);
 	rcu_barrier();
+    ovs_vxlan_exit();
 	ovs_vport_exit();
 	ovs_flow_exit();
 	ovs_tnl_exit();

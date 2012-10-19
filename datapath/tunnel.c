@@ -1078,15 +1078,6 @@ static struct rtable *find_route(struct vport *vport,
     if (likely(tos == RT_TOS(mutable->tos)))
         *cache = build_cache(vport, mutable, rt, OVS_CB(skb)->tun_ipv4_dst);
 
-#if 0
-    if (OVS_CB(skb)->tun_ipv4_dst != rt->rt_dst) {
-        pr_warn ("+++ %s:%d: PKT DST: 0x%x, CDST: 0x%x",
-                __func__, __LINE__,
-                OVS_CB(skb)->tun_ipv4_dst,
-                rt->rt_dst);
-    }
-#endif
-
     return rt;
 }
 

@@ -1,4 +1,4 @@
- /*
+/*
  * Copyright (c) 2011 Nicira Networks.
  * Distributed under the terms of the GNU GPL version 2.
  *
@@ -19,6 +19,8 @@
 #include <linux/igmp.h>                 /* for ip_mc_join_group */
 #include <linux/in_route.h>
 #include <linux/inetdevice.h>
+#include <linux/jiffies.h>
+#include <linux/time.h>
 
 #include <net/icmp.h>
 #include <net/ip.h>
@@ -51,10 +53,7 @@ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb);
 static int vxlan_send(struct vport *vport, struct sk_buff *skb);
 static int vxlan_rcv(struct sock *sk, struct sk_buff *skb);
 static int vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb);
-static void vxlan_mac_table_entry_learn (struct tnl_vport *vxport, 
-        struct iphdr *iph, struct sk_buff *skb);
-static struct vxlan_mac_entry *vxlan_vme_get_peer_vtep (struct tnl_vport 
-        *vxport, u8 *macaddr);
+static struct vxlan_mac_entry *vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr);
 static struct sk_buff * vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
 					struct dst_entry *dst, struct sk_buff *skb);
@@ -63,6 +62,7 @@ static void vxlan_build_header(const struct vport *vport,
 static int vxlan_set_config (struct vport *vport, struct nlattr *options, 
         struct tnl_mutable_config  *mutable,
         struct tnl_mutable_config  *old_mutable);
+
 
 const struct vport_ops ovs_vxlan_vport_ops = {
 	.type		      = OVS_VPORT_TYPE_VXLAN,
@@ -100,6 +100,7 @@ static const struct tnl_ops ovs_ipsec_vxlan_tnl_ops = {
 };
 
 
+static struct hlist_head *vxlan_mac_table;
 
 static void
 vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
@@ -111,50 +112,30 @@ vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
 	kfree(vme);
 }
 
-static int
-vxlan_vme_add (struct tnl_vport *vxport, __be32 peer_vtep, 
-                u8 *macaddr, u32 flags)
+static inline int
+vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags, u32 age)
 {
     struct vxlan_mac_entry *vme;
-    struct hlist_head      *bucket, *mac_table;
+    struct hlist_head      *bucket;
     u32                     hash;
-
-    vme = vxlan_vme_get_peer_vtep (vxport, macaddr);
-    if (vme != NULL) {
-        if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED)
-            vme->peer = peer_vtep;
-
-    OVS_VXLAN_DEBUG("Existing vme. vni: %d, saddr: 0x%x, "
-            "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
-            rtnl_dereference(vxport->mutable)->vni,
-            vme->peer, 
-            vme->macaddr[0], 
-            vme->macaddr[1], 
-            vme->macaddr[2], 
-            vme->macaddr[3], 
-            vme->macaddr[4], 
-            vme->macaddr[5], 
-            vme->flags);
-
-        return 0;
-    }
 
     vme = kzalloc (sizeof (struct vxlan_mac_entry), GFP_ATOMIC);
     if (!vme)
         return -ENOMEM;
 
     vme->peer = peer_vtep;
-    vme->flags = flags;
+    vme->vni = vni;
     memcpy (vme->macaddr, macaddr, ETH_ALEN);
+    vme->flags = flags;
+    vme->age = msecs_to_jiffies(age) + jiffies;
 
     hash = jhash (macaddr, ETH_ALEN, 0);
-    mac_table = rcu_dereference_rtnl(vxport->vxlan_mac_table);
-    bucket = &mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
+    bucket = &vxlan_mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
     hlist_add_head_rcu (&vme->hash_node, bucket);
 
     OVS_VXLAN_DEBUG("NEW VME. vni: %d, saddr: 0x%x, mac:%x:%x:%x:%x:%x:%x, " 
             "flags: 0x%x",
-            rtnl_dereference(vxport->mutable)->vni,
+            vni,
             vme->peer, 
             vme->macaddr[0], 
             vme->macaddr[1], 
@@ -167,20 +148,65 @@ vxlan_vme_add (struct tnl_vport *vxport, __be32 peer_vtep,
     return 0;
 }
 
+static void
+vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
+{
+    OVS_VXLAN_DEBUG("Existing vme. vni: %d, saddr: 0x%x, "
+                "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
+                vme->vni,
+                vme->peer, 
+                vme->macaddr[0], 
+                vme->macaddr[1], 
+                vme->macaddr[2], 
+                vme->macaddr[3], 
+                vme->macaddr[4], 
+                vme->macaddr[5], 
+                vme->flags);
+
+    hlist_del_init_rcu (&vme->hash_node);
+    if (rcu_free == true) {
+        call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
+    }
+    else {
+        kfree (vme);
+    }
+}
+
+static inline void
+vxlan_vme_update (struct vxlan_mac_entry *vme, __be32 peer_vtep, u32 age)
+{
+    if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
+        vme->peer = peer_vtep;
+        vme->age = msecs_to_jiffies(age) + jiffies;
+
+        OVS_VXLAN_DEBUG("Updating vme. vni: %d, saddr: 0x%x, "
+                "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
+                vme->vni,
+                vme->peer, 
+                vme->macaddr[0], 
+                vme->macaddr[1], 
+                vme->macaddr[2], 
+                vme->macaddr[3], 
+                vme->macaddr[4], 
+                vme->macaddr[5], 
+                vme->flags);
+    }
+}
+
 static struct vxlan_mac_entry *
-vxlan_vme_get_peer_vtep (struct tnl_vport *vxport, u8 *macaddr)
+vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr)
 {
     struct vxlan_mac_entry *vme;
-    struct hlist_head      *bucket, *mac_table;
+    struct hlist_head      *bucket;
     struct hlist_node      *node;
     u32                     hash;
 
     hash = jhash (macaddr, ETH_ALEN, 0);
-    mac_table = rcu_dereference_rtnl(vxport->vxlan_mac_table);
-    bucket = &mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
+    bucket = &vxlan_mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
 
 	hlist_for_each_entry_rcu(vme, node, bucket, hash_node) {
-        if (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0) {
+        if ((vme->vni == vni) && 
+                (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0)) {
             return vme;
         }
     }
@@ -282,10 +308,9 @@ static struct vport *
 vxlan_create(const struct vport_parms *parms)
 {
 	struct vport                   *vport;
-	struct tnl_vport             *vxport;
+	struct tnl_vport               *vxport;
 	struct tnl_mutable_config      *mutable, *old_mutable;
-    struct hlist_head              *mac_table;
-	int                             initial_frag_id, err, i;
+	int                             initial_frag_id, err;
 
     mutable = old_mutable = NULL;
 	vport = ovs_vport_alloc(sizeof(struct tnl_vport),
@@ -294,16 +319,6 @@ vxlan_create(const struct vport_parms *parms)
 		err = PTR_ERR(vport);
 		goto error;
 	}
-
-	mac_table = kmalloc(VXLAN_MAC_TABLE_SIZE * sizeof(struct hlist_head*),
-            GFP_KERNEL);
-	if (mac_table == NULL) {
-		err = -ENOMEM;
-		goto error_free_vport;
-    }
-
-	for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++)
-		INIT_HLIST_HEAD(&mac_table[i]);
 
 	vxport = tnl_vport_priv(vport);
 	strcpy(vxport->name, parms->name);
@@ -314,7 +329,7 @@ vxlan_create(const struct vport_parms *parms)
 		err = -ENOMEM;
         if (mutable) kfree (mutable);
         if (old_mutable) kfree (old_mutable);
-		goto error_free_mac_table;
+		goto error_free_vport;
 	}
 
 	random_ether_addr(old_mutable->eth_addr);
@@ -331,19 +346,15 @@ vxlan_create(const struct vport_parms *parms)
     else {
         vxport->tnl_ops = &ovs_vxlan_tnl_ops;
     }
-
-    rcu_assign_pointer (vxport->vxlan_mac_table, mac_table);
     rcu_assign_pointer (vxport->mutable, mutable);
-    
-	spin_lock_init(&vxport->cache_lock);
 
+	spin_lock_init(&vxport->cache_lock);
 #ifdef NEED_CACHE_TIMEOUT
 	vxport->cache_exp_interval = MAX_CACHE_EXP -
 				       (net_random() % (MAX_CACHE_EXP / 2));
 #endif
 
 	ovs_tnl_port_table_add_port(vport);
-
     kfree (old_mutable);
 
 	return vport;
@@ -351,8 +362,6 @@ vxlan_create(const struct vport_parms *parms)
 error_free_mutables:
 	kfree(mutable);
     kfree (old_mutable);
-error_free_mac_table:
-    kfree (mac_table);
 error_free_vport:
 	ovs_vport_free(vport);
 error:
@@ -364,12 +373,7 @@ vxlan_destroy(struct vport *vport)
 {
 	struct tnl_vport              *vxport;
     struct socket                 *rcv_socket, *mcast_socket;
-    struct hlist_head             *mac_table;
-    struct vxlan_mac_entry        *vme;
-    struct hlist_node             *node;
-    struct hlist_head             *bucket;
     struct tnl_mutable_config     *mutable;
-    int                            i;
 
 	vxport = tnl_vport_priv(vport);
     mutable = rtnl_dereference(vxport->mutable);
@@ -377,15 +381,6 @@ vxlan_destroy(struct vport *vport)
     vxlan_close_socket (mutable, rcv_socket);
     mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
     vxlan_close_socket (mutable, mcast_socket);
-
-    mac_table = rtnl_dereference(vxport->vxlan_mac_table);
-    for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++) {
-        bucket = &mac_table [i];
-        hlist_for_each_entry_rcu(vme, node, bucket, hash_node) {
-            hlist_del_init_rcu (&vme->hash_node);
-            call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
-        }
-    }
 
     ovs_tnl_destroy (vport);
 }
@@ -663,21 +658,31 @@ vxlan_update_header(const struct vport *vport,
 	return skb;
 }
 
+#if 0
 static void
 vxlan_mac_table_entry_learn (struct tnl_vport *vxport, struct iphdr *iph, 
         struct sk_buff *skb)
 {
 	struct ethhdr *eh;
     struct tnl_mutable_config *mutable;
+    struct vxlan_mac_entry *vme;
         
     mutable = rcu_dereference_rtnl(vxport->mutable);
 
 	skb_reset_mac_header(skb);
 	eh = eth_hdr(skb);
-
-    vxlan_vme_add (vxport, iph->saddr, eh->h_source, 
-                      VXLAN_MAC_ENTRY_FLAGS_LEARNED);
+    vme = vxlan_vme_get_peer_vtep(vxport->vni, eh->h_source);
+    if (vme) {
+        /*  We already have an entry. Just update the timer. */
+        vxlan_vme_update (vme, iph->saddr, mutable->mac_entry_age);
+    }
+    else {
+        /* New Entry. Learn the entry. */
+        vxlan_vme_add(vxport->vni, iph->saddr, eh->h_source, 
+                VXLAN_MAC_ENTRY_FLAGS_LEARNED, mutable->mac_entry_age);
+    }
 }
+#endif
 
 static int
 vxlan_send(struct vport *vport, struct sk_buff *skb)
@@ -688,12 +693,12 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
     struct tnl_mutable_config  *mutable;
     struct tnl_vport         *vxport;
 
-	vxport = tnl_vport_priv(vport);
-    mutable = rtnl_dereference(vxport->mutable);
-	eh = eth_hdr(skb);
-	iph = ip_hdr(skb);
+	vxport    = tnl_vport_priv(vport);
+    mutable   = rtnl_dereference(vxport->mutable);
+	eh        = eth_hdr(skb);
+	iph       = ip_hdr(skb);
 
-    vme = vxlan_vme_get_peer_vtep (vxport, eh->h_dest);
+    vme = vxlan_vme_get_peer_vtep (mutable->vni, eh->h_dest);
 
     OVS_VXLAN_DEBUG("vxlan_send[VNI=%d,len=%d]: "
             "SMAC:%x:%x:%x:%x:%x:%x, " 
@@ -727,7 +732,6 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
             ((vme) ? vme->peer : 0)
             );
 
-    OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
     if (vme) {
         OVS_CB(skb)->tun_ipv4_dst = vme->peer;
         OVS_CB(skb)->vxlan_udp_port = mutable->vtep_port;
@@ -743,6 +747,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
     else {
         goto error;
     }
+    OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
 
     return ovs_tnl_send (vport, skb);
 
@@ -763,6 +768,9 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 	struct vxlanhdr *vxh;
 	struct iphdr *iph;
     u32    vni;
+	struct ethhdr *eh;
+    struct tnl_mutable_config *mutable;
+    struct vxlan_mac_entry *vme;
 
 	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
 		goto error;
@@ -794,6 +802,8 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
 	}
+    vxport = tnl_vport_priv (vport);
+    mutable = rcu_dereference_rtnl(vxport->mutable);
 
 	__skb_pull(skb, VXLAN_HLEN);
 
@@ -801,16 +811,26 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 		tunnel_type |= TNL_T_IPSEC; */
 
 	skb_postpull_rcsum(skb, skb_transport_header(skb), VXLAN_HLEN + ETH_HLEN);
-    vxport = tnl_vport_priv (vport);
+	skb_reset_mac_header(skb);
+	eh = eth_hdr(skb);
 
-    vxlan_mac_table_entry_learn (vxport, iph, skb);
+    vme = vxlan_vme_get_peer_vtep(vni, eh->h_source);
+    if (vme) {
+        /*  We already have an entry. Just update the timer. */
+        vxlan_vme_update (vme, iph->saddr, mutable->mac_entry_age);
+    }
+    else {
+        /* New Entry. Learn the entry. */
+        vxlan_vme_add(vni, iph->saddr, eh->h_source, 
+                VXLAN_MAC_ENTRY_FLAGS_LEARNED, mutable->mac_entry_age);
+    }
 
 	/* Save outer tunnel values */
 	OVS_CB(skb)->tun_ipv4_src = iph->saddr;
-	OVS_CB(skb)->tun_ipv4_dst = iph->daddr;/* XXX What should we do for MCAST*/
+	OVS_CB(skb)->tun_ipv4_dst = iph->daddr;
 	OVS_CB(skb)->tun_ipv4_tos = iph->tos;
 	OVS_CB(skb)->tun_ipv4_ttl = iph->ttl;
-    OVS_CB(skb)->tun_id = key.in_key;
+    OVS_CB(skb)->tun_id       = key.in_key;
 
 	ovs_tnl_rcv(vport, skb, iph->tos);
 
@@ -846,6 +866,41 @@ vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
 
     return vxlan_rcv_process (sk, skb, true);
 }
+
+int
+ovs_vxlan_init()
+{
+	int                             i;
+
+	vxlan_mac_table = kzalloc(VXLAN_MAC_TABLE_SIZE * sizeof(struct hlist_head),
+                            GFP_KERNEL);
+	if (vxlan_mac_table == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++)
+		INIT_HLIST_HEAD(&vxlan_mac_table[i]);
+
+    return 0;
+}
+
+void
+ovs_vxlan_exit()
+{
+    struct vxlan_mac_entry  *vme;
+    struct hlist_node       *node;
+    struct hlist_head       *bucket;
+    int                      i;
+
+    for (i = 0; i < VXLAN_MAC_TABLE_SIZE; i++) {
+        bucket = &vxlan_mac_table [i];
+        hlist_for_each_entry_rcu(vme, node, bucket, hash_node) {
+            vxlan_vme_delete (vme, false);
+        }
+    }
+
+    kfree (vxlan_mac_table);
+}
+
 
 #else
 #warning VXLAN tunneling will not be available on kernels before 2.6.26
