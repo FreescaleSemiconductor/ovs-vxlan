@@ -50,7 +50,7 @@ enum {
 struct vxlan_mac_entry {
     struct rcu_head    rcu;
     struct hlist_node  hash_node;
-    struct hlist_node  lru_node;
+    struct list_head   lru_link;
 	u32                vni;
     __be32             peer; 
     unsigned long      age;
