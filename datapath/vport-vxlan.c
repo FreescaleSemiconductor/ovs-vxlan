@@ -47,9 +47,18 @@
 #define OVS_VXLAN_DEBUG(fmt, arg...) (void)0
 #endif
 
+#ifdef OVS_VXLAN_VME_DEBUG_ENABLE
+#define OVS_VXLAN_VME_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
+#else
 #define OVS_VXLAN_VME_DEBUG(fmt, arg...) (void)0
-//#define OVS_VXLAN_VME_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
+#endif
 
+
+struct vxlan_mac_hlr_table {
+    struct hlist_head   hash_table;
+    struct list_head    lru_list;
+    spinlock_t          lock;
+};
 
 static struct vport *vxlan_create(const struct vport_parms *parms);
 static void vxlan_destroy(struct vport *vport);
@@ -109,18 +118,6 @@ static DECLARE_DELAYED_WORK(vxlan_mac_table_ageout_wq, vxlan_mac_table_cleaner);
 static int vxlan_vport_count = 0;
 static int vxlan_cleaner_start_index = 0;
 
-#if 0
-static struct hlist_head *vxlan_mac_table;
-static LIST_HEAD(vxlan_mac_table_lru);
-static spinlock_t  vxlan_lru_lock;
-#endif
-
-struct vxlan_mac_hlr_table {
-    struct hlist_head   hash_table;
-    struct list_head    lru_list;
-    spinlock_t          lock;
-};
-
 static struct vxlan_mac_hlr_table *vxlan_mac_table;
 
 static void
@@ -156,11 +153,13 @@ vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags, u32 age)
 
     spin_lock (&hh->lock);
 
-    //hlist_add_head_rcu (&vme->hash_node, &hh->hash_table);
-    hlist_add_head (&vme->hash_node, &hh->hash_table);
+    hlist_add_head_rcu (&vme->hash_node, &hh->hash_table);
+
+    //hlist_add_head (&vme->hash_node, &hh->hash_table);
+
     if (flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
-        //list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-        list_add_tail (&vme->lru_link, &hh->lru_list);
+        list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
+        //list_add_tail (&vme->lru_link, &hh->lru_list);
     }
 
     spin_unlock (&hh->lock);
@@ -187,12 +186,12 @@ vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
 
 
     if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
-        //list_del_rcu(&vme->lru_link);
-        list_del(&vme->lru_link);
+        list_del_rcu(&vme->lru_link);
+        //list_del(&vme->lru_link);
     }
 
-    //hlist_del_init_rcu (&vme->hash_node);
-    hlist_del_init (&vme->hash_node);
+    hlist_del_init_rcu (&vme->hash_node);
+    //hlist_del_init (&vme->hash_node);
 
     if (rcu_free == true)
         call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
@@ -203,7 +202,7 @@ vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
 static struct vxlan_mac_entry *
 vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
 {
-    struct vxlan_mac_entry         *vme, *rvme = NULL;
+    struct vxlan_mac_entry         *vme;
     struct vxlan_mac_hlr_table     *hh;
     struct hlist_node              *node;
     u32                             hash;
@@ -211,30 +210,42 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
     hash = jhash (macaddr, ETH_ALEN, 0);
     hh = &vxlan_mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
 
-    spin_lock (&hh->lock);
-
-	//hlist_for_each_entry_rcu(vme, node, &hh->hash_table, hash_node) {
-	hlist_for_each_entry(vme, node, &hh->hash_table, hash_node) {
+	hlist_for_each_entry_rcu(vme, node, &hh->hash_table, hash_node) {
+	/*hlist_for_each_entry(vme, node, &hh->hash_table, hash_node) {*/
         if ((vme->vni == vni) && 
             (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0)) {
+
             if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
+
+                spin_lock (&hh->lock);
                 vme->age = msecs_to_jiffies(vme->age) + jiffies;
                 vme->peer = (peer_vtep != 0) ? peer_vtep : vme->peer;
-                //list_del_rcu(&vme->lru_link);
-                //list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-                list_move_tail(&vme->lru_link, &hh->lru_list);
+                list_del_rcu(&vme->lru_link);
+                list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
+                //list_move_tail(&vme->lru_link, &hh->lru_list);
+                spin_unlock (&hh->lock);
             }
-            rvme = vme;
-            break;
+
+            OVS_VXLAN_VME_DEBUG("VME FOUND. vni: %d, saddr: 0x%x, "
+                    "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
+                    vme->vni, vme->peer, 
+                    vme->macaddr[0], vme->macaddr[1], vme->macaddr[2], 
+                    vme->macaddr[3], vme->macaddr[4], vme->macaddr[5], 
+                    vme->flags);
+
+            return vme;
         }
     }
 
-    spin_unlock (&hh->lock);
+    OVS_VXLAN_VME_DEBUG("VME NOT FOUND. vni: %d, saddr: 0x%x, "
+            "mac:%x:%x:%x:%x:%x:%x",
+            vni, peer_vtep, 
+            macaddr[0], macaddr[1], macaddr[2], 
+            macaddr[3], macaddr[4], macaddr[5]);
 
-    return rvme;
+    return NULL;
 }
 
-#ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
 {
@@ -249,39 +260,43 @@ vxlan_vme_ut_add_entries (int count)
         vni = vni & 0x00FFFFFF;
 	    random_ether_addr(eth_addr);
 
-        if (vxlan_vme_get_peer_vtep(vni, eth_addr, 0, 2000) == NULL) {
+        if (vxlan_vme_get_peer_vtep(vni, eth_addr, 0, 1000) == NULL) {
             vxlan_vme_add (vni, saddr, eth_addr, 
-                    VXLAN_MAC_ENTRY_FLAGS_LEARNED, 2000);
+                    VXLAN_MAC_ENTRY_FLAGS_LEARNED, 1000);
         }
     }
-    OVS_VXLAN_VME_DEBUG("UT: Added %d entries", count);
+    pr_warn ("UT: Added %d entries", count);
 }
-#endif
 
 static void 
 vxlan_mac_table_cleaner(struct work_struct *work)
 {
-    int                       i, j, k, deleted = 0;
-    struct vxlan_mac_entry   *vme;
-    struct vxlan_mac_hlr_table *hh;
+    int                          i, j, k, deleted = 0;
+    struct vxlan_mac_entry      *vme;
+    struct vxlan_mac_hlr_table  *hh;
+
+    rcu_read_lock ();
 
     for (k = 0, i = vxlan_cleaner_start_index; 
             (i < VXLAN_MAC_TABLE_SIZE) && (k < VXLAN_UPPER_STAGGER_COUNT);
             i++, k++) {
 
         hh = &vxlan_mac_table [i];
-        if (!spin_trylock (&hh->lock)) {
-            OVS_VXLAN_VME_DEBUG("Failed to get spin lock");
-            continue;
-        }
 
         for (j = 0; (j < VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT) && 
                 (!list_empty(&hh->lru_list)); j++) {
             vme = list_first_entry(&hh->lru_list, struct vxlan_mac_entry, 
                     lru_link);
             if (jiffies >= vme->age) {
-                vxlan_vme_delete (vme, false);
-                deleted++;
+                if (spin_trylock (&hh->lock)) {
+                    vxlan_vme_delete (vme, true);
+                    deleted++;
+                    spin_unlock (&hh->lock);
+                }
+                else {
+                    OVS_VXLAN_VME_DEBUG("Failed to get spin lock");
+                    continue;
+                }
             }
             else {
                 /*
@@ -295,8 +310,9 @@ vxlan_mac_table_cleaner(struct work_struct *work)
             }
         }
 
-        spin_unlock (&hh->lock);
     }
+
+    rcu_read_unlock ();
 
 #ifdef VXLAN_VME_UT
     if (deleted != 0)
@@ -556,7 +572,7 @@ vxlan_parse_options (struct tnl_mutable_config *mutable,
     else
         mutable->mcast_port = VXLAN_MCAST_PORT;
         
-    mutable->mac_entry_age = 2000; /* 2 seconds. 2000 milli seconds */
+    mutable->mac_entry_age = 1000; /* 1 seconds. 1000 milli seconds */
 
 	return 0;
 }
@@ -857,6 +873,10 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 	struct ethhdr *eh;
     struct tnl_mutable_config *mutable;
     struct vxlan_mac_entry *vme;
+
+    if (!rcu_read_lock_held ()) {
+        OVS_VXLAN_VME_DEBUG("RCU READ LOCK is NOT HELD");
+    }
 
 	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
 		goto error;
