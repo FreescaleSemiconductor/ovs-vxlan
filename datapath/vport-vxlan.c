@@ -52,6 +52,13 @@
 #define OVS_VXLAN_VME_DEBUG(fmt, arg...) (void)0
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+#define SOCK_SADDR(sk) (inet_sk(sk)->rcv_saddr)
+#define SOCK_SPORT(sk) (inet_sk(sk)->sport)
+#else
+#define SOCK_SADDR(sk) (inet_sk(sk)->inet_rcv_saddr)
+#define SOCK_SPORT(sk) (inet_sk(sk)->inet_sport)
+#endif
 
 struct vxlan_mac_hlr_table {
     struct hlist_head   hash_table;
@@ -349,8 +356,8 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
 
 	list_for_each_entry_rcu(tnl_socket, &vxlan_socket_list, node) {
         socket = tnl_socket->socket;
-        if ((inet_sk(socket->sk)->inet_rcv_saddr == addr) &&
-                (inet_sk(socket->sk)->inet_sport == htons(port))) {
+        if ((SOCK_SADDR(socket->sk) == addr) &&
+                (SOCK_SPORT(socket->sk) == htons(port))) {
             OVS_VXLAN_DEBUG("Found existing socket: 0x%x:%d", addr, port);
             atomic_inc (&tnl_socket->refcount);
             *retnl_socket = tnl_socket;
@@ -389,16 +396,20 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
     else {
         memset(&fl, 0, sizeof(fl));
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
-        fl.nl_u.ip4_vdaddr = addr;
-        fl.nl_u.ip4_vsaddr = mutable->vtep;
+        fl.nl_u.ip4_u.daddr = addr;
+        fl.nl_u.ip4_u.saddr = mutable->vtep;
         fl.proto = IPPROTO_UDP;
-        rt = ip_route_output_key(sock_net(sk), &rt, &fl);
+        if (ip_route_output_key(sock_net(sk), &rt, &fl)) {
+            pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
+                    mutable->vtep, addr, rt);
+            err = -EHOSTUNREACH;
+            goto error;
+        }
 #else
         fl.daddr = addr;
         fl.saddr = mutable->vtep;
         fl.flowi4_proto = IPPROTO_UDP;
         rt = ip_route_output_key(sock_net(sk), &fl);
-#endif
 
         if (IS_ERR (rt)) {
             pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
@@ -406,7 +417,7 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
             err = -EHOSTUNREACH;
             goto error;
         }
-
+#endif
         dev = rt_dst(rt).dev;
         ip_rt_put(rt);
         if (__in_dev_get_rtnl(dev) == NULL) {
@@ -473,7 +484,7 @@ __vxlan_release_tnl_socket (struct tnl_mutable_config *mutable,
         return;
 
     socket = tnl_socket->socket;
-    saddr = inet_sk(socket->sk)->inet_rcv_saddr;
+    saddr = SOCK_SADDR(socket->sk);
 
     OVS_VXLAN_DEBUG("Refcount: %d, 0x%x:%d", tnl_socket->refcount.counter,
             saddr, ntohs(inet_sk(socket->sk)->inet_sport));
@@ -986,9 +997,6 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
     struct tnl_mutable_config *mutable;
     struct vxlan_mac_entry *vme;
 
-    if (!rcu_read_lock_held ()) {
-        OVS_VXLAN_VME_DEBUG("RCU READ LOCK is NOT HELD");
-    }
 
 	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
 		goto error;
@@ -1004,16 +1012,13 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 		     vxh->vx_vni & htonl(0xff))) {
 		goto error;
     }
-
     vni = ntohl(vxh->vx_vni) >> 8;
 
     memset (&key, 0, sizeof(struct port_lookup_key));
     key.in_key = cpu_to_be64(vni);
-
     key.tunnel_type = (TNL_T_PROTO_VXLAN | TNL_T_KEY_EXACT);
 	if (sec_path_esp(skb))
 		key.tunnel_type |= TNL_T_IPSEC;
-
 	port_key_set_net(&key, dev_net(skb->dev));
 
     vport = ovs_tnl_port_table_lookup (&key, &m);
@@ -1054,7 +1059,7 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
     return 0;
 
 error:
-    ovs_vport_record_error(vport, VPORT_E_RX_DROPPED);
+    //ovs_vport_record_error(vport, VPORT_E_RX_DROPPED);
 	kfree_skb(skb);
 	return 0;
 }
@@ -1072,7 +1077,7 @@ vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
 	struct iphdr    *iph;
     __be32           saddr;
 
-    saddr = inet_sk(sk)->inet_rcv_saddr;
+    saddr = SOCK_SADDR(sk);
 	iph = ip_hdr(skb);
 
     /* This packet is sent by us. Discard. Silently. */
