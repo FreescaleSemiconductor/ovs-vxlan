@@ -342,7 +342,7 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
 	struct flowi fl;
 #else
-    struct flowi4  fl;
+    struct flowi4 fl;
 #endif
 
     OVS_VXLAN_DEBUG("Trying to Create a socket: 0x%x:%d", addr, port);
@@ -388,15 +388,18 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
     }
     else {
         memset(&fl, 0, sizeof(fl));
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+        fl.nl_u.ip4_vdaddr = addr;
+        fl.nl_u.ip4_vsaddr = mutable->vtep;
+        fl.proto = IPPROTO_UDP;
+        rt = ip_route_output_key(sock_net(sk), &rt, &fl);
+#else
         fl.daddr = addr;
         fl.saddr = mutable->vtep;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
-        fl.proto = IPPROTO_UDP;
-#else
         fl.flowi4_proto = IPPROTO_UDP;
+        rt = ip_route_output_key(sock_net(sk), &fl);
 #endif
 
-        rt = ip_route_output_key(sock_net(sk), &fl);
         if (IS_ERR (rt)) {
             pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
                     mutable->vtep, addr, rt);
