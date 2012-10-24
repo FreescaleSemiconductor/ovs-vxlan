@@ -944,6 +944,23 @@ error:
     return 0;
 }
 
+
+static bool 
+sec_path_esp(struct sk_buff *skb)
+{
+	struct sec_path *sp = skb_sec_path(skb);
+
+	if (sp) {
+		int i;
+
+		for (i = 0; i < sp->len; i++)
+			if (sp->xvec[i]->id.proto == XFRM_PROTO_ESP)
+				return true;
+	}
+
+	return false;
+}
+
 /* Called with rcu_read_lock and BH disabled. */
 static int
 vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
@@ -982,7 +999,11 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
 
     memset (&key, 0, sizeof(struct port_lookup_key));
     key.in_key = cpu_to_be64(vni);
+
     key.tunnel_type = (TNL_T_PROTO_VXLAN | TNL_T_KEY_EXACT);
+	if (sec_path_esp(skb))
+		key.tunnel_type |= TNL_T_IPSEC;
+
 	port_key_set_net(&key, dev_net(skb->dev));
 
     vport = ovs_tnl_port_table_lookup (&key, &m);
@@ -997,9 +1018,6 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb, bool multicast)
     mutable = rcu_dereference_rtnl(vxport->mutable);
 
 	__skb_pull(skb, VXLAN_HLEN);
-
-    /* - XXXX tunnel_type = TNL_T_PROTO_VXLAN; if (sec_path_esp(skb))
-		tunnel_type |= TNL_T_IPSEC; */
 
 	skb_postpull_rcsum(skb, skb_transport_header(skb), VXLAN_HLEN + ETH_HLEN);
 	skb_reset_mac_header(skb);
