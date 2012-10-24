@@ -21,7 +21,6 @@
 #include <linux/inetdevice.h>
 #include <linux/jiffies.h>
 #include <linux/time.h>
-#include <linux/atomic.h>
 
 #include <net/icmp.h>
 #include <net/ip.h>
@@ -241,6 +240,7 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
     return NULL;
 }
 
+#define VXLAN_VME_UT (1)
 #ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
@@ -335,11 +335,15 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
     struct net_device *dev;
     struct tnl_socket *tnl_socket;
     struct rtable *rt;
-    struct flowi4  fl;
     struct sockaddr_in sin;
     struct sock * sk;
     struct socket *socket;
     int err;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+	struct flowi fl;
+#else
+    struct flowi4  fl;
+#endif
 
     OVS_VXLAN_DEBUG("Trying to Create a socket: 0x%x:%d", addr, port);
 
@@ -386,8 +390,11 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
         memset(&fl, 0, sizeof(fl));
         fl.daddr = addr;
         fl.saddr = mutable->vtep;
-        fl.flowi4_tos = 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+        fl.proto = IPPROTO_UDP;
+#else
         fl.flowi4_proto = IPPROTO_UDP;
+#endif
 
         rt = ip_route_output_key(sock_net(sk), &fl);
         if (IS_ERR (rt)) {
@@ -434,9 +441,9 @@ vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
 {
     int err;
 
-    spin_lock(&vxlan_socket_lock);
+    //spin_lock(&vxlan_socket_lock);
     err = __vxlan_open_tnl_socket (mutable, addr, port, retnl_socket, mlink);
-    spin_unlock(&vxlan_socket_lock);
+    //spin_unlock(&vxlan_socket_lock);
 
     return err;
 }
@@ -490,9 +497,9 @@ static void
 vxlan_release_tnl_socket (struct tnl_mutable_config *mutable, 
         struct tnl_socket *tnl_socket)
 {
-    spin_lock(&vxlan_socket_lock);
+    //spin_lock(&vxlan_socket_lock);
     __vxlan_release_tnl_socket (mutable, tnl_socket);
-    spin_unlock(&vxlan_socket_lock);
+    //spin_unlock(&vxlan_socket_lock);
 }
 
 static struct vport *
