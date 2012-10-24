@@ -254,6 +254,13 @@ struct tnl_cache {
 	/* The cached header follows after padding for alignment. */
 };
 
+struct tnl_socket {
+    struct rcu_head      rcu;
+    struct list_head     node;
+    atomic_t             refcount;
+    struct socket       *socket;
+};
+
 struct tnl_vport {
 	struct rcu_head rcu;
 	struct hlist_node hash_node;
@@ -283,8 +290,8 @@ struct tnl_vport {
 	unsigned long cache_exp_interval;
 #endif
 
-    struct socket __rcu *vxlan_rcv_socket;  /* VTEP receive socket */
-    struct socket __rcu *vxlan_mcast_socket; /* MULTICAST socket */
+    struct tnl_socket __rcu *vxlan_rcv_socket; /* VTEP socket */
+    struct tnl_socket __rcu *vxlan_mcast_socket; /* MULTICAST socket */
 };
 
 

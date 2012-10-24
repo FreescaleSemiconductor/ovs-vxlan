@@ -21,6 +21,7 @@
 #include <linux/inetdevice.h>
 #include <linux/jiffies.h>
 #include <linux/time.h>
+#include <linux/atomic.h>
 
 #include <net/icmp.h>
 #include <net/ip.h>
@@ -40,7 +41,6 @@
 #define VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT  (5) /* XXX - Explain */
 #define VXLAN_UPPER_STAGGER_COUNT             (100)
 
-//#define OVS_VXLAN_DEBUG_ENABLE
 #ifdef OVS_VXLAN_DEBUG_ENABLE
 #define OVS_VXLAN_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
@@ -117,8 +117,9 @@ static const struct tnl_ops ovs_ipsec_vxlan_tnl_ops = {
 static DECLARE_DELAYED_WORK(vxlan_mac_table_ageout_wq, vxlan_mac_table_cleaner);
 static int vxlan_vport_count = 0;
 static int vxlan_cleaner_start_index = 0;
-
 static struct vxlan_mac_hlr_table *vxlan_mac_table;
+static LIST_HEAD(vxlan_socket_list);
+static spinlock_t vxlan_socket_lock;
 
 static void
 vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
@@ -155,11 +156,8 @@ vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags, u32 age)
 
     hlist_add_head_rcu (&vme->hash_node, &hh->hash_table);
 
-    //hlist_add_head (&vme->hash_node, &hh->hash_table);
-
     if (flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
         list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-        //list_add_tail (&vme->lru_link, &hh->lru_list);
     }
 
     spin_unlock (&hh->lock);
@@ -187,11 +185,9 @@ vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
 
     if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
         list_del_rcu(&vme->lru_link);
-        //list_del(&vme->lru_link);
     }
 
     hlist_del_init_rcu (&vme->hash_node);
-    //hlist_del_init (&vme->hash_node);
 
     if (rcu_free == true)
         call_rcu(&vme->rcu, vxlan_rcu_vme_free_cb);
@@ -211,7 +207,6 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
     hh = &vxlan_mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
 
 	hlist_for_each_entry_rcu(vme, node, &hh->hash_table, hash_node) {
-	/*hlist_for_each_entry(vme, node, &hh->hash_table, hash_node) {*/
         if ((vme->vni == vni) && 
             (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0)) {
 
@@ -222,8 +217,8 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
                 vme->peer = (peer_vtep != 0) ? peer_vtep : vme->peer;
                 list_del_rcu(&vme->lru_link);
                 list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-                //list_move_tail(&vme->lru_link, &hh->lru_list);
                 spin_unlock (&hh->lock);
+
             }
 
             OVS_VXLAN_VME_DEBUG("VME FOUND. vni: %d, saddr: 0x%x, "
@@ -246,6 +241,7 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
     return NULL;
 }
 
+#ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
 {
@@ -267,6 +263,7 @@ vxlan_vme_ut_add_entries (int count)
     }
     pr_warn ("UT: Added %d entries", count);
 }
+#endif
 
 static void 
 vxlan_mac_table_cleaner(struct work_struct *work)
@@ -322,6 +319,7 @@ vxlan_mac_table_cleaner(struct work_struct *work)
 #endif
     
     vxlan_cleaner_start_index = (i == VXLAN_MAC_TABLE_SIZE) ? 0 : i;
+
     OVS_VXLAN_VME_DEBUG("global cleaner index: %d, i: %d", 
             vxlan_cleaner_start_index, i);
 
@@ -331,17 +329,37 @@ vxlan_mac_table_cleaner(struct work_struct *work)
 
 
 static int
-vxlan_open_socket (struct tnl_mutable_config *mutable, __be32 addr, u16 port, 
-                   struct socket **socket, int *mlink)
+__vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr, 
+                       u16 port, struct tnl_socket **retnl_socket, int *mlink)
 {
     struct net_device *dev;
+    struct tnl_socket *tnl_socket;
     struct rtable *rt;
     struct flowi4  fl;
     struct sockaddr_in sin;
     struct sock * sk;
+    struct socket *socket;
     int err;
 
-	err = sock_create(AF_INET, SOCK_DGRAM, 0, socket);
+    OVS_VXLAN_DEBUG("Trying to Create a socket: 0x%x:%d", addr, port);
+
+	list_for_each_entry_rcu(tnl_socket, &vxlan_socket_list, node) {
+        socket = tnl_socket->socket;
+        if ((inet_sk(socket->sk)->inet_rcv_saddr == addr) &&
+                (inet_sk(socket->sk)->inet_sport == htons(port))) {
+            OVS_VXLAN_DEBUG("Found existing socket: 0x%x:%d", addr, port);
+            atomic_inc (&tnl_socket->refcount);
+            *retnl_socket = tnl_socket;
+            return 0;
+        }
+    }
+
+    tnl_socket = kzalloc (sizeof (struct tnl_socket), GFP_KERNEL);
+    if (tnl_socket == NULL) {
+        return -ENOMEM;
+    }
+
+	err = sock_create(AF_INET, SOCK_DGRAM, 0, &socket);
 	if (err) {
         pr_warn ("vxlan: Failed to create socket for: 0x%x:%d", addr, port);
         return err;
@@ -350,7 +368,7 @@ vxlan_open_socket (struct tnl_mutable_config *mutable, __be32 addr, u16 port,
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = addr;
 	sin.sin_port = htons(port);
-	err = kernel_bind(*socket, (struct sockaddr *)&sin,
+	err = kernel_bind(socket, (struct sockaddr *)&sin,
                       sizeof(struct sockaddr_in));
 	if (err) {
         pr_warn ("vxlan: Failed to bind socket for: 0x%x:%d, err=%d", 
@@ -358,7 +376,7 @@ vxlan_open_socket (struct tnl_mutable_config *mutable, __be32 addr, u16 port,
 		goto error;
     }
 
-    sk = (*socket)->sk;
+    sk = (socket)->sk;
 	udp_sk(sk)->encap_type = UDP_ENCAP_VXLAN;
 
     if (ipv4_is_multicast(addr) == false) {
@@ -391,32 +409,90 @@ vxlan_open_socket (struct tnl_mutable_config *mutable, __be32 addr, u16 port,
         ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
     }
 
+    list_add_tail_rcu(&tnl_socket->node, &vxlan_socket_list);
+    atomic_set (&tnl_socket->refcount, 1);
+    tnl_socket->socket = socket;
+    *retnl_socket = tnl_socket;
+
+    OVS_VXLAN_DEBUG("Created new %s socket: 0x%x:%d", 
+            ((ipv4_is_multicast(addr) == false) ?  " " : "MULTICAST"),
+            addr, port);
+
     return 0;
 
  error:
-	sock_release(*socket);
-    *socket = NULL;
+	sock_release(socket);
+    kfree (tnl_socket);
+    *retnl_socket = NULL;
+
+    return err;
+}
+
+static int
+vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr, 
+                       u16 port, struct tnl_socket **retnl_socket, int *mlink)
+{
+    int err;
+
+    spin_lock(&vxlan_socket_lock);
+    err = __vxlan_open_tnl_socket (mutable, addr, port, retnl_socket, mlink);
+    spin_unlock(&vxlan_socket_lock);
+
     return err;
 }
 
 
 static void
-vxlan_close_socket (struct tnl_mutable_config *mutable, struct socket *socket)
+vxlan_tnl_socket_free_cb(struct rcu_head *rcu)
+{
+	struct tnl_socket *tnl_socket;
+
+    tnl_socket = container_of(rcu, struct tnl_socket, rcu);
+
+	kfree(tnl_socket);
+}
+
+static void
+__vxlan_release_tnl_socket (struct tnl_mutable_config *mutable, 
+        struct tnl_socket *tnl_socket)
 {
     __be32 saddr;
+    struct socket *socket;
 
-    if (socket == NULL)
+    if (tnl_socket == NULL)
         return;
-    
+
+    socket = tnl_socket->socket;
     saddr = inet_sk(socket->sk)->inet_rcv_saddr;
-    if ((ipv4_is_multicast(saddr) == true) && (mutable->mlink)) {
-        struct in_device *in_dev;
-        in_dev = inetdev_by_index(port_key_get_net(&mutable->key), 
+
+    OVS_VXLAN_DEBUG("Refcount: %d, 0x%x:%d", tnl_socket->refcount.counter,
+            saddr, ntohs(inet_sk(socket->sk)->inet_sport));
+
+    if (atomic_dec_and_test(&tnl_socket->refcount)) {
+        OVS_VXLAN_DEBUG("Released SOCKET(refc=%d), 0x%x:%d", 
+                tnl_socket->refcount.counter, saddr, 
+                ntohs(inet_sk(socket->sk)->inet_sport));
+
+        if ((ipv4_is_multicast(saddr) == true) && (mutable->mlink)) {
+            struct in_device *in_dev;
+            in_dev = inetdev_by_index(port_key_get_net(&mutable->key), 
                                      mutable->mlink);
-		if (in_dev)
-			ip_mc_dec_group(in_dev, mutable->key.daddr);
+            if (in_dev)
+                ip_mc_dec_group(in_dev, mutable->key.daddr);
+        }
+        sock_release (tnl_socket->socket);
+        list_del_rcu(&tnl_socket->node);
+        call_rcu(&tnl_socket->rcu, vxlan_tnl_socket_free_cb);
     }
-    sock_release (socket);
+}
+
+static void
+vxlan_release_tnl_socket (struct tnl_mutable_config *mutable, 
+        struct tnl_socket *tnl_socket)
+{
+    spin_lock(&vxlan_socket_lock);
+    __vxlan_release_tnl_socket (mutable, tnl_socket);
+    spin_unlock(&vxlan_socket_lock);
 }
 
 static struct vport *
@@ -472,11 +548,13 @@ vxlan_create(const struct vport_parms *parms)
 	ovs_tnl_port_table_add_port(vport);
     kfree (old_mutable);
 
-    if (vxlan_vport_count == 0) {
+    vxlan_vport_count++;
+    if (vxlan_vport_count == 1) {
         schedule_delayed_work(&vxlan_mac_table_ageout_wq,
                 VXLAN_MAC_TABLE_AGEOUT_INTERVAL);
+        OVS_VXLAN_DEBUG("STARTING DELAYED WORK: %d", vxlan_vport_count);
     }
-    vxlan_vport_count++;
+    OVS_VXLAN_DEBUG("vxlan_create: VPORT COUNT: %d", vxlan_vport_count);
 
 	return vport;
 
@@ -493,21 +571,28 @@ static void
 vxlan_destroy(struct vport *vport)
 {
 	struct tnl_vport              *vxport;
-    struct socket                 *rcv_socket, *mcast_socket;
+    struct tnl_socket             *tnl_socket;
     struct tnl_mutable_config     *mutable;
 
 	vxport = tnl_vport_priv(vport);
+    OVS_VXLAN_DEBUG("Destroying vxport: %s", vxport->name);
+
     mutable = rtnl_dereference(vxport->mutable);
-    rcv_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
-    vxlan_close_socket (mutable, rcv_socket);
-    mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
-    vxlan_close_socket (mutable, mcast_socket);
+
+    tnl_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
+    vxlan_release_tnl_socket (mutable, tnl_socket);
+
+    tnl_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
+    vxlan_release_tnl_socket (mutable, tnl_socket);
 
     ovs_tnl_destroy (vport);
-    if (vxlan_vport_count == 1) {
-        vxlan_vport_count--;
+
+    vxlan_vport_count--;
+    if (vxlan_vport_count == 0) {
 		cancel_delayed_work_sync(&vxlan_mac_table_ageout_wq);
+        OVS_VXLAN_DEBUG("CANCELING DELAYED WORK: %d", vxlan_vport_count);
     }
+    OVS_VXLAN_DEBUG("vxlan_destroy: VPORT COUNT: %d", vxlan_vport_count);
 }
 
 static const struct nla_policy vxlan_nl_policy[OVS_TUNNEL_ATTR_MAX + 1] = {
@@ -582,12 +667,12 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
         struct tnl_mutable_config  *mutable,
         struct tnl_mutable_config  *old_mutable)
 {
-	struct tnl_vport                 *vxport;
-    struct socket                      *rcv_socket, *old_rcv_socket;
-    struct socket                      *mcast_socket, *old_mcast_socket;
-	int                                 err, mlink;
+	struct tnl_vport    *vxport;
+    struct tnl_socket   *rcv_socket, *old_rcv_socket;
+    struct tnl_socket   *mcast_socket, *old_mcast_socket;
+	int                  err, mlink;
 
-    rcv_socket = old_rcv_socket = old_mcast_socket = NULL;
+    mcast_socket = rcv_socket = old_rcv_socket = old_mcast_socket = NULL;
     
     vxport = tnl_vport_priv(vport);
 
@@ -627,19 +712,19 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 
     if ((mutable->vtep != old_mutable->vtep) ||
         (mutable->vtep_port != old_mutable->vtep_port)) {
-        err = vxlan_open_socket (mutable, mutable->vtep, mutable->vtep_port,
+        err = vxlan_open_tnl_socket (mutable, mutable->vtep, mutable->vtep_port,
                                    &rcv_socket, &mlink);
         if (err != 0) {
             goto error;
         }
         old_rcv_socket = rtnl_dereference(vxport->vxlan_rcv_socket);
         rcu_assign_pointer(vxport->vxlan_rcv_socket, rcv_socket);
-        vxlan_close_socket (mutable, old_rcv_socket);
+        vxlan_release_tnl_socket (mutable, old_rcv_socket);
     }
 
     if ((mutable->mcast_ip != old_mutable->mcast_ip) ||
         (mutable->mcast_port != old_mutable->mcast_port)) {
-        err = vxlan_open_socket (mutable, mutable->mcast_ip, 
+        err = vxlan_open_tnl_socket (mutable, mutable->mcast_ip, 
                                  mutable->mcast_port, &mcast_socket, &mlink);
         if (err != 0) {
             goto sock_free;
@@ -647,14 +732,14 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 
         old_mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
         rcu_assign_pointer(vxport->vxlan_mcast_socket, mcast_socket);
-        vxlan_close_socket(mutable, old_mcast_socket);
+        vxlan_release_tnl_socket(mutable, old_mcast_socket);
         mutable->mlink = mlink;
     }
 
 	return 0;
     
  sock_free:
-    vxlan_close_socket (mutable, rcv_socket);
+    vxlan_release_tnl_socket (mutable, rcv_socket);
  error:
 	return err;
 }
@@ -989,6 +1074,7 @@ ovs_vxlan_init()
         spin_lock_init (&hh->lock);
     }
 
+    spin_lock_init (&vxlan_socket_lock);
 
     return 0;
 }
