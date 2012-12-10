@@ -40,12 +40,14 @@
 #define VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT  (5) /* XXX - Explain */
 #define VXLAN_UPPER_STAGGER_COUNT             (100)
 
+#define OVS_VXLAN_DEBUG_ENABLE (1)
 #ifdef OVS_VXLAN_DEBUG_ENABLE
 #define OVS_VXLAN_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
 #define OVS_VXLAN_DEBUG(fmt, arg...) (void)0
 #endif
 
+#define OVS_VXLAN_VME_DEBUG_ENABLE (1)
 #ifdef OVS_VXLAN_VME_DEBUG_ENABLE
 #define OVS_VXLAN_VME_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
@@ -247,7 +249,7 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr, __be32 peer_vtep, u32 age)
     return NULL;
 }
 
-#define VXLAN_VME_UT (1)
+//#define VXLAN_VME_UT (1)
 #ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)

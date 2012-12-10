@@ -973,7 +973,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
     ovs_be32 mcast_ip = htonl(0);
     uint64_t vni = 0;
 
-    supports_csum = !strcmp(type, "vxlan") || !strcmp(type, "ipsec_vxlan");
+    supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
     is_ipsec = !strncmp(type, "ipsec_", 6);
 
     flags = TNL_F_DF_DEFAULT | TNL_F_PMTUD | TNL_F_HDR_CACHE;
