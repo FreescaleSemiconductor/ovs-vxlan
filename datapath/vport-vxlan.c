@@ -26,6 +26,7 @@
 #include <net/ip.h>
 #include <net/xfrm.h>
 #include <net/inet_connection_sock.h>
+#include <net/udp.h>
 
 #include "datapath.h"
 #include "tunnel.h"
@@ -431,6 +432,7 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
         *mlink = dev->ifindex;
         ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
     }
+    //udp_encap_enable ();
 
     list_add_tail_rcu(&tnl_socket->node, &vxlan_socket_list);
     atomic_set (&tnl_socket->refcount, 1);
