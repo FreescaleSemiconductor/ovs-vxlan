@@ -431,8 +431,12 @@ __vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
         udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
         *mlink = dev->ifindex;
         ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
+        OVS_VXLAN_DEBUG("vxlan: Multicast interface: %s", dev->name);
     }
-    //udp_encap_enable ();
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
+    udp_encap_enable ();
+#endif
 
     list_add_tail_rcu(&tnl_socket->node, &vxlan_socket_list);
     atomic_set (&tnl_socket->refcount, 1);
