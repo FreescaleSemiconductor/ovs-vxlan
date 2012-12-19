@@ -134,7 +134,6 @@ struct tnl_mutable_config {
     u32               vni;
     __be32            vtep;
     __be32            mcast_ip;
-    u32               mac_entry_age;
     u16               vtep_port;
     u16               mcast_port;
 };
