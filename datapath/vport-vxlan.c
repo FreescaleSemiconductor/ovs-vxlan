@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2011 Nicira, Inc.
  * Copyright (c) 2012 Cisco Systems, Inc.
- * Copyright (c) 2013 Freescale, Inc.
+ * Copyright (c) 2012 Freescale, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of version 2 of the GNU General Public
