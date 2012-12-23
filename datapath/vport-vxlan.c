@@ -258,7 +258,7 @@ vxlan_vme_get (u32 vni, u8 *macaddr)
     return NULL;
 }
 
-#define VXLAN_VME_UT (1)
+//#define VXLAN_VME_UT (1)
 #ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
