@@ -85,7 +85,7 @@ static const struct nl_policy ovs_vxlan_policy[] = {
  *
  * So far only undocumented commands honor this option, so we don't document
  * the option itself. */
-static int verbose;
+static int more;
 static bool dryrun = false;
 static const struct command all_commands[];
 static struct nl_sock * genl_sock;
@@ -135,7 +135,6 @@ parse_options(int argc, char *argv[])
         VLOG_OPTION_ENUMS
     };
     static struct option long_options[] = {
-        {"statistics", no_argument, NULL, 's'},
         {"more", no_argument, NULL, 'm'},
         {"dryrun", no_argument, NULL, 'd'},
         {"timeout", required_argument, NULL, 't'},
@@ -157,7 +156,7 @@ parse_options(int argc, char *argv[])
 
         switch (c) {
         case 'm':
-            verbose++;
+            more++;
             break;
 
         case 'd':
@@ -196,18 +195,20 @@ parse_options(int argc, char *argv[])
 static void
 usage(void)
 {
-    printf("%s: Open vSwitch VxLAN management utility\n"
+    printf("%s: Open vSwitch VXLAN management utility\n"
            "usage: %s [OPTIONS] COMMAND [ARG...]\n"
-           "  add-host vni=<VNI> vtep=<VTEP> host=<END Host> add a new host entry for a given VTEP and VNI\n"
-           "  del-host vni=<VNI> host=<END Host> remove a host entry for a given VNI\n"
-           "  del-vme vtep=<VTEP> vni=<VNI> ip=<MAC address>  remove a MAC entry  for a given VTEP and VNI\n"
-           "  show                   prints the VXLAN MAC table\n",
+           "  add-peer vni=<VNI> vtep=<VTEP> add a new peer for a given VNI\n"
+           "  del-peer vni=<VNI> vtep=<VTEP> remove a peer for a given VNI\n"
+           "  del-vme vtep=<VTEP> vni=<VNI> mac=<MAC address>  remove a MAC entry  for a given VTEP and VNI\n"
+           "  dump-vme                   print the VXLAN mac table\n"
+           "  dump-peer                  print the VXLAN peer table\n",
            program_name, program_name);
     vlog_usage();
     printf("\nOther options:\n"
            "  -t, --timeout=SECS          give up after SECS seconds\n"
            "  -h, --help                  display this help message\n"
-           "  -V, --version               display version information\n");
+           "  -V, --version               display version information\n"
+           "  -m, --more                  print extra information\n");
     exit(EXIT_SUCCESS);
 }
 
@@ -298,7 +299,7 @@ vxctl_add_peer(int argc, char *argv[])
         e = vxlan_nl_send (OVS_VXLAN_CMD_PEER_NEW, &cfg);
         if (e == 0) {
             if (cfg.status_code == 0) {
-                if (verbose) {
+                if (more) {
                     print_peer (&cfg, NULL);
                 }
             }
@@ -327,7 +328,7 @@ vxctl_del_peer(int argc, char *argv[])
         e = vxlan_nl_send (OVS_VXLAN_CMD_PEER_DEL, &cfg);
         if (e == 0) {
             if (cfg.status_code == 0) {
-                if (verbose) {
+                if (more) {
                     print_peer (&cfg, NULL);
                 }
             }
@@ -402,7 +403,7 @@ vxctl_del_vme(int argc, char *argv[])
 
         if (e == 0) {
             if (cfg.status_code == 0) {
-                if (verbose) {
+                if (more) {
                     print_vme (&cfg, NULL);
                 }
             }

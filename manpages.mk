@@ -219,30 +219,8 @@ ovsdb/remote-passive.man:
 ovsdb/remote-passive.man:
 
 utilities/ovs-vxctl.8: \
-	utilities/ovs-vxctl.8.in \
-	lib/ssl-bootstrap.man \
-	lib/ssl-peer-ca-cert.man \
-	lib/ssl.man \
-	lib/table.man \
-	lib/vconn-active.man \
-	lib/vconn-passive.man \
-	lib/vlog.man \
-	ovsdb/remote-active.man \
-	ovsdb/remote-active.man \
-	ovsdb/remote-passive.man \
-	ovsdb/remote-passive.man
+	utilities/ovs-vxctl.8.in
 utilities/ovs-vxctl.8.in:
-lib/ssl-bootstrap.man:
-lib/ssl-peer-ca-cert.man:
-lib/ssl.man:
-lib/table.man:
-lib/vconn-active.man:
-lib/vconn-passive.man:
-lib/vlog.man:
-ovsdb/remote-active.man:
-ovsdb/remote-active.man:
-ovsdb/remote-passive.man:
-ovsdb/remote-passive.man:
 
 vswitchd/ovs-brcompatd.8: \
 	vswitchd/ovs-brcompatd.8.in \

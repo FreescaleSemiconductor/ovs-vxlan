@@ -911,6 +911,35 @@ Deconfigure STP from above:
 .IP
 .B "ovs\-vsctl clear Bridge br0 stp_enable"
 .PP
+
+.SS "Virtual eXtensible Local Area Network (VXLAN)"
+.PP
+Add a VXLAN tunnel port \fBvxlan2\fR to bridge \fBbr0\fR. Configure
+\fBvxlan2\fR to have tunnel id(VNI) as 2, local tunnel endpoint(VTEP) IP 
+address as 1.2.3.4 and multicast ip address as 224.0.55.55
+.IP
+.B "ovs\-vsctl add\-port vxlan2 \-\- set Interface vxlan2 type=vxlan \(rs"
+.IP
+.B "      options:vni=2 options:vtep=1.2.3.4 options:mcast_ip=224.0.55.55"
+.IP
+VTEP need to be local ip address that VXLAN will listen on.
+.PP
+Following options are provided to configure VXLAN interface:
+.IP
+\fBvni\fR: VXLAN network segment id or tunnel id.
+.IP
+\fBvtep\fR: Local IP address to listen on for VXLAN udp traffic.
+.IP
+\fBmcast_ip\fR: Mulitcast ip address for dynamic learning of mac address.
+.IP
+\fBvtep_udp_port\fR: UPD port number to listen on. Default UDP port numberis
+\fB4341\fR. VXLAN uses this port number for outgoing traffic as well.
+.IP
+\fBmcast_udp_port\fR: Multicast UPD port number to listen on. Default UDP 
+port numberis \fB4341\fR. VXLAN uses this port number for outgoing traffic as well.
+.PP
+To configure VXLAN overlay network manually see \fBovs\-vxctl(8)\fR.
+
 .SH "EXIT STATUS"
 .IP "0"
 Successful program execution.
