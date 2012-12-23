@@ -496,4 +496,34 @@ enum ovs_action_attr {
 
 #define OVS_ACTION_ATTR_MAX (__OVS_ACTION_ATTR_MAX - 1)
 
+#define OVS_VXLAN_FAMILY  "ovs_vxlan"
+#define OVS_VXLAN_MCGROUP "ovs_vxlan"
+#define OVS_VXLAN_VERSION 0x1
+
+
+/**
+ * enum ovs_vxlan_cmd - Commands to add VxLAN MAC entries by hand.
+ */
+enum ovs_vxlan_cmd {
+    OVS_VXLAN_CMD_UNSPEC,
+    OVS_VXLAN_CMD_PEER_NEW,
+    OVS_VXLAN_CMD_PEER_DEL,
+    OVS_VXLAN_CMD_VME_DEL,
+    OVS_VXLAN_CMD_VME_DUMP,
+    OVS_VXLAN_CMD_PEER_DUMP,
+};
+
+enum ovs_vxlan_attr {
+    OVS_VXLAN_ATTR_UNSPEC,
+    OVS_VXLAN_ATTR_VNI,
+    OVS_VXLAN_ATTR_VTEP,
+    OVS_VXLAN_ATTR_MAC,
+    OVS_VXLAN_ATTR_STATUS_CODE,
+    OVS_VXLAN_ATTR_STATUS_STR,
+    OVS_VXLAN_ATTR_AGE,
+    __OVS_VXLAN_ATTR_MAX
+};
+
+#define OVS_VXLAN_ATTR_MAX (__OVS_VXLAN_ATTR_MAX - 1)
+
 #endif /* _LINUX_OPENVSWITCH_H */

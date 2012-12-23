@@ -33,12 +33,15 @@
 #include <linux/inetdevice.h>
 #include <linux/jiffies.h>
 #include <linux/time.h>
+#include <linux/if_arp.h>
+#include <linux/genetlink.h>
 
 #include <net/icmp.h>
 #include <net/ip.h>
 #include <net/xfrm.h>
 #include <net/inet_connection_sock.h>
 #include <net/udp.h>
+#include <net/genetlink.h>
 
 #include "datapath.h"
 #include "tunnel.h"
@@ -51,17 +54,17 @@
 #define VXLAN_MAC_TABLE_SIZE                  (1024)
 #define VXLAN_VME_AGE                         (5000) /* 5 sec. */
 #define VXLAN_MAC_AGEOUT_INTERVAL             (2 * 1000)
-#define VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT  (5)
-#define VXLAN_UPPER_STAGGER_COUNT             (100)
+#define VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT  (100)
+#define VXLAN_PEER_TABLE_SIZE                 (128)
 
-#define OVS_VXLAN_DEBUG_ENABLE (1)
+//#define OVS_VXLAN_DEBUG_ENABLE (1)
 #ifdef OVS_VXLAN_DEBUG_ENABLE
 #define OVS_VXLAN_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
 #define OVS_VXLAN_DEBUG(fmt, arg...) (void)0
 #endif
 
-#define OVS_VXLAN_VME_DEBUG_ENABLE (1)
+//#define OVS_VXLAN_VME_DEBUG_ENABLE (1)
 #ifdef OVS_VXLAN_VME_DEBUG_ENABLE
 #define OVS_VXLAN_VME_DEBUG(fmt, arg...) printk(KERN_WARNING fmt, ##arg)
 #else
@@ -82,6 +85,13 @@ struct vxlan_mac_hlr_table {
     spinlock_t          lock;
 };
 
+struct vxlan_peer_entry {
+    struct rcu_head   rcu;
+    struct hlist_node hash_node;
+    uint32_t          vni;
+    __be32            peer_vtep;
+};
+
 static struct vport *vxlan_create(const struct vport_parms *parms);
 static void vxlan_destroy(struct vport *vport);
 static int vxlan_set_options(struct vport *vport, struct nlattr *options);
@@ -89,7 +99,7 @@ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb);
 static int vxlan_send(struct vport *vport, struct sk_buff *skb);
 static int vxlan_rcv(struct sock *sk, struct sk_buff *skb);
 static int vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb);
-static struct vxlan_mac_entry *vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr);
+static struct vxlan_mac_entry *vxlan_vme_get (u32 vni, u8 *macaddr);
 static struct sk_buff * vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
 					struct dst_entry *dst, struct sk_buff *skb);
@@ -99,6 +109,8 @@ static int vxlan_set_config (struct vport *vport, struct nlattr *options,
         struct tnl_mutable_config  *mutable,
         struct tnl_mutable_config  *old_mutable);
 static void vxlan_vme_cleaner(struct work_struct *work);
+static bool vxlan_peer_check (u32 vni, __be32 peer);
+
 
 const struct vport_ops ovs_vxlan_vport_ops = {
 	.type		      = OVS_VPORT_TYPE_VXLAN,
@@ -142,6 +154,7 @@ static int vxlan_cleaner_start_index = 0;
 static struct vxlan_mac_hlr_table *vxlan_mac_table;
 static LIST_HEAD(vxlan_socket_list);
 static spinlock_t vxlan_socket_lock;
+static struct hlist_head vxlan_peer_table[VXLAN_PEER_TABLE_SIZE];
 
 static void
 vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
@@ -154,7 +167,7 @@ vxlan_rcu_vme_free_cb(struct rcu_head *rcu)
 }
 
 static inline int
-vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags)
+vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr)
 {
     struct vxlan_mac_entry       *vme;
     struct vxlan_mac_hlr_table   *hh;
@@ -167,7 +180,6 @@ vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags)
     vme->peer = peer_vtep;
     vme->vni = vni;
     memcpy (vme->macaddr, macaddr, ETH_ALEN);
-    vme->flags = flags;
     vme->age = msecs_to_jiffies(VXLAN_VME_AGE) + jiffies;
 
     hash = jhash (macaddr, ETH_ALEN, 0);
@@ -175,18 +187,14 @@ vxlan_vme_add (u32 vni, __be32 peer_vtep, u8 *macaddr, u32 flags)
 
     spin_lock (&hh->lock);
     hlist_add_head_rcu (&vme->hash_node, &hh->hash_table);
-
-    if (flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
-        list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-    }
+    list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
     spin_unlock (&hh->lock);
 
     OVS_VXLAN_VME_DEBUG("NEW VME. vni: %d, saddr: 0x%x, "
-            "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
-            vni, vme->peer, 
-            vme->macaddr[0], vme->macaddr[1], vme->macaddr[2], 
-            vme->macaddr[3], vme->macaddr[4], vme->macaddr[5], 
-            vme->flags);
+                        "mac:%x:%x:%x:%x:%x:%x",
+                        vni, vme->peer, 
+                        vme->macaddr[0], vme->macaddr[1], vme->macaddr[2], 
+                        vme->macaddr[3], vme->macaddr[4], vme->macaddr[5]);
 
     return 0;
 }
@@ -196,17 +204,12 @@ vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
 {
 
     OVS_VXLAN_VME_DEBUG("DELETING VME. vni: %d, saddr: 0x%x, "
-                        "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
+                        "mac:%x:%x:%x:%x:%x:%x",
                         vme->vni, vme->peer, 
                         vme->macaddr[0], vme->macaddr[1], vme->macaddr[2], 
-                        vme->macaddr[3], vme->macaddr[4], vme->macaddr[5], 
-                        vme->flags);
+                        vme->macaddr[3], vme->macaddr[4], vme->macaddr[5]);
 
-
-    if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
-        list_del_rcu(&vme->lru_link);
-    }
-
+    list_del_rcu(&vme->lru_link);
     hlist_del_init_rcu (&vme->hash_node);
 
     if (rcu_free == true)
@@ -216,7 +219,7 @@ vxlan_vme_delete (struct vxlan_mac_entry *vme, bool rcu_free)
 }
 
 static struct vxlan_mac_entry *
-vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr)
+vxlan_vme_get (u32 vni, u8 *macaddr)
 {
     struct vxlan_mac_entry         *vme;
     struct vxlan_mac_hlr_table     *hh;
@@ -230,20 +233,18 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr)
         if ((vme->vni == vni) && 
             (memcmp (vme->macaddr, macaddr, ETH_ALEN) == 0)) {
 
-            if (vme->flags & VXLAN_MAC_ENTRY_FLAGS_LEARNED) {
-                spin_lock (&hh->lock);
-                vme->age += msecs_to_jiffies(VXLAN_VME_AGE);
-                list_del_rcu(&vme->lru_link);
-                list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
-                spin_unlock (&hh->lock);
-            }
-
+            spin_lock (&hh->lock);
+            vme->age = msecs_to_jiffies(VXLAN_VME_AGE) + jiffies;
+            list_del_rcu(&vme->lru_link);
+            list_add_tail_rcu(&vme->lru_link, &hh->lru_list);
+            spin_unlock (&hh->lock);
+            
             OVS_VXLAN_VME_DEBUG("VME FOUND. vni: %d, VTEP: 0x%x "
-                                "mac:%x:%x:%x:%x:%x:%x, flags: 0x%x",
+                                "mac:%x:%x:%x:%x:%x:%x",
                                 vme->vni, vme->peer, vme->macaddr[0],
                                 vme->macaddr[1], vme->macaddr[2],
                                 vme->macaddr[3], vme->macaddr[4],
-                                vme->macaddr[5], vme->flags);
+                                vme->macaddr[5]);
 
             return vme;
         }
@@ -257,15 +258,15 @@ vxlan_vme_get_peer_vtep (u32 vni, u8 *macaddr)
     return NULL;
 }
 
-//#define VXLAN_VME_UT (1)
+#define VXLAN_VME_UT (1)
 #ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
 {
-    __be32 saddr;
-    u32    vni;
-    u8     eth_addr [ETH_ALEN];
-    int    i;
+    u32     vni;
+    u8      eth_addr [ETH_ALEN];
+    int     i;
+    __be32  saddr;
 
     for (i = 0; i < count; i++) {
         get_random_bytes (&saddr, 4);
@@ -273,8 +274,8 @@ vxlan_vme_ut_add_entries (int count)
         vni = vni & 0x00FFFFFF;
 	    random_ether_addr(eth_addr);
 
-        if (vxlan_vme_get_peer_vtep(vni, eth_addr) == NULL) {
-            vxlan_vme_add (vni, saddr, eth_addr, VXLAN_MAC_ENTRY_FLAGS_LEARNED);
+        if (vxlan_vme_get(vni, eth_addr) == NULL) {
+            vxlan_vme_add (vni, saddr, eth_addr);
         }
     }
     pr_warn ("UT: Added %d entries", count);
@@ -284,27 +285,22 @@ vxlan_vme_ut_add_entries (int count)
 static void 
 vxlan_vme_cleaner(struct work_struct *work)
 {
-    int                          i, j, k, deleted = 0;
-    struct vxlan_mac_entry      *vme;
+    int                          i, deleted = 0;
+    struct vxlan_mac_entry      *vme, *tvme;
     struct vxlan_mac_hlr_table  *hh;
 
     rcu_read_lock ();
 
-    for (k = 0, i = vxlan_cleaner_start_index; 
-            (i < VXLAN_MAC_TABLE_SIZE) && (k < VXLAN_UPPER_STAGGER_COUNT);
-            i++, k++) {
-
+    for (i = vxlan_cleaner_start_index; i < VXLAN_MAC_TABLE_SIZE; i++) {
         hh = &vxlan_mac_table [i];
-
-        for (j = 0; (j < VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT) && 
-                (!list_empty(&hh->lru_list)); j++) {
-            vme = list_first_entry(&hh->lru_list, struct vxlan_mac_entry, 
-                    lru_link);
+        list_for_each_entry_safe_reverse(vme, tvme, &hh->lru_list, lru_link){
             if (jiffies >= vme->age) {
                 if (spin_trylock (&hh->lock)) {
                     vxlan_vme_delete (vme, true);
                     deleted++;
                     spin_unlock (&hh->lock);
+                    if (deleted > VXLAN_MAC_TABLE_AGEOUT_STAGGER_COUNT)
+                        goto out;
                 }
                 else {
                     OVS_VXLAN_VME_DEBUG("Failed to get spin lock");
@@ -312,19 +308,11 @@ vxlan_vme_cleaner(struct work_struct *work)
                 }
             }
             else {
-                /*
-                 * If the first entry is not old, then it is guaranteed 
-                 * that next won't be old. This is because we always move 
-                 * last accessed entry to the tail.
-                 */
-                OVS_VXLAN_VME_DEBUG("%d: VALID: jiffies=%lu, vme->age: %lu",
-                        j, jiffies, vme->age);
                 break;
             }
         }
-
     }
-
+ out:
     rcu_read_unlock ();
     
     vxlan_cleaner_start_index = (i == VXLAN_MAC_TABLE_SIZE) ? 0 : i;
@@ -348,13 +336,13 @@ static int
 vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr, 
                        u16 port, struct tnl_socket **retnl_socket, int *mlink)
 {
-    struct net_device *dev;
-    struct tnl_socket *tnl_socket;
-    struct rtable *rt;
-    struct sockaddr_in sin;
-    struct sock * sk;
-    struct socket *socket;
-    int err;
+    struct net_device   *dev;
+    struct tnl_socket   *tnl_socket;
+    struct rtable       *rt;
+    struct sock         *sk;
+    struct socket       *socket;
+    struct sockaddr_in   sin;
+    int                  err;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
 	struct flowi fl;
 #else
@@ -479,8 +467,8 @@ static void
 vxlan_release_tnl_socket (struct tnl_mutable_config *mutable, 
         struct tnl_socket *tnl_socket)
 {
-    __be32 saddr;
     struct socket *socket;
+    __be32         saddr;
 
     if (tnl_socket == NULL)
         return;
@@ -626,9 +614,9 @@ static int
 vxlan_parse_options (struct tnl_mutable_config *mutable,
                      struct nlattr *options)
 {
-	struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1];
-	int err;
-    __be64  vni;
+	struct nlattr   *a[OVS_TUNNEL_ATTR_MAX + 1];
+	int              err;
+    __be64           vni;
 
 	if (!options)
 		return -EINVAL;
@@ -735,7 +723,6 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
         vxlan_release_tnl_socket (mutable, old_rcv_socket);
     }
 
-    pr_warn ("Old: 0x%x, new: 0x%x", old_mutable->mcast_ip, mutable->mcast_ip);
     if ((mutable->mcast_ip != old_mutable->mcast_ip) ||
         (mutable->mcast_port != old_mutable->mcast_port)) {
         if (mutable->mcast_ip != 0) {
@@ -745,9 +732,6 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
             if (err != 0) {
                 goto sock_free;
             }
-        }
-        else {
-            pr_warn ("mcastip is 0");
         }
 
         old_mcast_socket = rtnl_dereference(vxport->vxlan_mcast_socket);
@@ -767,9 +751,9 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 static int
 vxlan_set_options(struct vport *vport, struct nlattr *options)
 {
-	struct tnl_vport                 *vxport;
-	struct tnl_mutable_config          *old_mutable, *mutable;
-    int                              err;
+	struct tnl_vport             *vxport;
+	struct tnl_mutable_config    *old_mutable, *mutable;
+    int                           err;
     
     vxport = tnl_vport_priv(vport);
 
@@ -808,9 +792,8 @@ vxlan_set_options(struct vport *vport, struct nlattr *options)
 static int
 vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
 {
-	const struct tnl_vport *vxlan_vport;
+	const struct tnl_vport          *vxlan_vport;
 	const struct tnl_mutable_config *mutable;
-
 
     vxlan_vport = tnl_vport_priv(vport);
     mutable = rcu_dereference_rtnl(vxlan_vport->mutable);
@@ -852,8 +835,8 @@ static void
 vxlan_build_header(const struct vport *vport, 
                    const struct tnl_mutable_config *mutable, void *header)
 {
-	struct udphdr *udph = header;
-	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
+	struct udphdr    *udph = header;
+	struct vxlanhdr  *vxh = (struct vxlanhdr *)(udph + 1);
 
 	udph->check = 0;
 	vxh->vx_flags = htonl(VXLAN_FLAGS);
@@ -865,8 +848,8 @@ vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
 					struct dst_entry *dst, struct sk_buff *skb)
 {
-	struct udphdr *udph = udp_hdr(skb);
-	struct vxlanhdr *vxh = (struct vxlanhdr *)(udph + 1);
+	struct udphdr    *udph = udp_hdr(skb);
+	struct vxlanhdr  *vxh = (struct vxlanhdr *)(udph + 1);
 
 	if (mutable->flags & TNL_F_OUT_KEY_ACTION)
 		vxh->vx_vni = htonl(mutable->vni);
@@ -887,8 +870,6 @@ vxlan_update_header(const struct vport *vport,
 	return skb;
 }
 
-
-
 static int
 vxlan_send(struct vport *vport, struct sk_buff *skb)
 {
@@ -897,36 +878,62 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
     struct vxlan_mac_entry     *vme;
     struct tnl_mutable_config  *mutable;
     struct tnl_vport           *vxport;
+    int                         i;
+    bool                        vxmesh_sent = false;
 
 	vxport    = tnl_vport_priv(vport);
     mutable   = rtnl_dereference(vxport->mutable);
 	eh        = eth_hdr(skb);
 	iph       = ip_hdr(skb);
 
-    vme = vxlan_vme_get_peer_vtep (mutable->vni, eh->h_dest);
+    OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
 
+    vme = vxlan_vme_get(mutable->vni, eh->h_dest);
     if (vme) {
         OVS_CB(skb)->tun_ipv4_dst = vme->peer;
         OVS_CB(skb)->vxlan_udp_port = mutable->vtep_port;
+        return ovs_tnl_send (vport, skb);
     }
-    else if (mutable->mcast_ip) {
+
+    if (mutable->mcast_ip) {
         /* 
          * We could not find the PEER VTEP for this mac address. This is 
          * where we want to do the multicast.
          */
         OVS_CB(skb)->tun_ipv4_dst = mutable->mcast_ip;
         OVS_CB(skb)->vxlan_udp_port = mutable->mcast_port;
+        return ovs_tnl_send (vport, skb);
     }
-    else {
-        goto error;
+
+    for (i = 0; i < VXLAN_PEER_TABLE_SIZE; i++) {
+        struct vxlan_peer_entry  *pe;
+        struct hlist_node        *node;
+        struct hlist_head        *hbucket;
+        u32                       hash, hk = mutable->vni;
+
+        hash = jhash (&hk, sizeof(32), 0);
+        hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
+        hlist_for_each_entry_rcu(pe, node, hbucket, hash_node){
+            if (pe->vni == mutable->vni) {
+                struct sk_buff *skb_cloned = skb_clone (skb, GFP_ATOMIC);
+                if (skb_cloned) {
+                    OVS_CB(skb_cloned)->tun_ipv4_dst = pe->peer_vtep;
+                    OVS_CB(skb_cloned)->vxlan_udp_port = mutable->vtep_port;
+                    ovs_tnl_send (vport, skb_cloned);
+                    vxmesh_sent = true;
+                }
+                else {
+                    OVS_VXLAN_DEBUG("FAILED TO CLONE");
+                }
+            }
+        }
     }
-    OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
 
-    return ovs_tnl_send (vport, skb);
+    if (vxmesh_sent == false)
+        ovs_vport_record_error(vport, VPORT_E_TX_DROPPED);
 
-error:
-    ovs_vport_record_error(vport, VPORT_E_TX_DROPPED);
     kfree_skb(skb);
+
     return 0;
 }
 
@@ -937,7 +944,6 @@ sec_path_esp(struct sk_buff *skb)
 
 	if (sp) {
 		int i;
-
 		for (i = 0; i < sp->len; i++)
 			if (sp->xvec[i]->id.proto == XFRM_PROTO_ESP)
 				return true;
@@ -950,17 +956,16 @@ sec_path_esp(struct sk_buff *skb)
 static inline int
 vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 {
-    struct port_lookup_key key;
-    const struct tnl_mutable_config *m;
-    struct vport     *vport;
-	struct tnl_vport *vxport;
-	struct vxlanhdr *vxh;
-	struct iphdr *iph;
-    u32    vni;
-	struct ethhdr *eh;
-    struct tnl_mutable_config *mutable;
-    struct vxlan_mac_entry *vme;
-
+    const struct tnl_mutable_config  *m;
+    struct vport                     *vport;
+	struct tnl_vport                 *vxport;
+	struct vxlanhdr                  *vxh;
+	struct iphdr                     *iph;
+	struct ethhdr                    *eh;
+    struct tnl_mutable_config        *mutable;
+    struct vxlan_mac_entry           *vme;
+    struct port_lookup_key            key;
+    u32                               vni;
 
 	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
 		goto error;
@@ -1001,12 +1006,11 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 	skb_reset_mac_header(skb);
 	eh = eth_hdr(skb);
 
-    vme = vxlan_vme_get_peer_vtep(vni, eh->h_source);
+    vme = vxlan_vme_get(vni, eh->h_source);
 
     if (unlikely(!vme)) {
         /* New Entry. Learn the entry. */
-        vxlan_vme_add (vni, iph->saddr, eh->h_source,
-                       VXLAN_MAC_ENTRY_FLAGS_LEARNED);
+        vxlan_vme_add (vni, iph->saddr, eh->h_source);
     }
     else if (unlikely(vme->peer != iph->saddr)) {
         /*
@@ -1049,6 +1053,260 @@ vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
     return vxlan_rcv_process (sk, skb);
 }
 
+/* Must be called with rcu_read_lock */
+static bool
+vxlan_peer_check (u32 vni, __be32 peer)
+{
+    struct hlist_head        *hbucket;
+    struct vxlan_peer_entry  *pe;
+    struct hlist_node        *node;
+    u32                       hk, hash;
+
+    WARN_ON_ONCE(!rcu_read_lock_held());
+
+    hk = vni;
+    hash = jhash (&hk, sizeof(32), 0);
+    hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
+
+    hlist_for_each_entry_rcu(pe, node, hbucket, hash_node) {
+        if (pe->vni == vni && pe->peer_vtep == peer) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* netlink support */
+int
+ovs_vxlan_peer_add (u32 vni, __be32 peer_vtep, struct sk_buff *reply)
+{
+    struct hlist_head          *hbucket;
+    struct vxlan_peer_entry    *pe;
+    u32                         hash, hk;
+
+    WARN_ON_ONCE(!rtnl_is_locked());
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_VNI, vni);
+    nla_put_u32(reply, OVS_VXLAN_ATTR_VTEP, peer_vtep);
+
+    if (vxlan_peer_check (vni, peer_vtep) == true) {
+        OVS_VXLAN_DEBUG ("PEER ENTRY PRESENT: VNI: %d, VTEP: 0x%x\n",
+                         vni, peer_vtep);
+
+        nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, EEXIST);
+	    nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "duplicate entry");
+        return -EEXIST;
+    }
+
+    pe = kzalloc (sizeof (struct vxlan_peer_entry), GFP_KERNEL);
+    if (pe) {
+        pe->vni = vni;
+        pe->peer_vtep = peer_vtep;
+        hk = vni;
+        hash = jhash (&hk, sizeof(32), 0);
+        hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
+        hlist_add_head_rcu (&pe->hash_node, hbucket);
+
+        OVS_VXLAN_DEBUG ("ADDED PEER. VNI: %d, VTEP: 0x%x\n", vni, peer_vtep);
+
+        nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, 0);
+	    nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "success");
+        return 0;
+    }
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, ENOMEM);
+    nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "malloc failure");
+
+    return -ENOMEM;
+}
+
+static void
+vxlan_rcu_peer_free_cb(struct rcu_head *rcu)
+{
+	struct vxlan_peer_entry *pe;
+
+    pe = container_of(rcu, struct vxlan_peer_entry, rcu);
+	kfree(pe);
+}
+
+int
+ovs_vxlan_peer_del (u32 vni, __be32 peer, struct sk_buff *reply)
+{
+    struct hlist_head          *hbucket;
+    struct vxlan_peer_entry    *pe;
+    struct hlist_node          *node;
+    u32                         hk, hash;
+
+    WARN_ON_ONCE(!rtnl_is_locked());
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_VNI, vni);
+    nla_put_u32(reply, OVS_VXLAN_ATTR_VTEP, peer);
+
+    hk = vni;
+    hash = jhash (&hk, sizeof(u32), 0);
+    hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
+
+    hlist_for_each_entry_rcu(pe, node, hbucket, hash_node) {
+        if (pe->vni == vni && pe->peer_vtep == peer) {
+
+            OVS_VXLAN_DEBUG ("DELETED PEER. VNI: %d, VTEP: 0x%x",
+                             pe->vni, pe->peer_vtep);
+
+            hlist_del_init_rcu (&pe->hash_node);
+            call_rcu (&pe->rcu, vxlan_rcu_peer_free_cb);
+
+            nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, 0);
+            nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "success");
+
+            return 0;
+        }
+    }
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, ENOENT);
+    nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "entry not found");
+
+    return -ENOENT;
+}
+
+int
+ovs_vxlan_vme_del (u32 vni, u8 *macaddr, struct sk_buff *reply)
+{
+    struct vxlan_mac_entry      *vme;
+    struct vxlan_mac_hlr_table  *hh;
+    u32                          hash;
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_VNI, vni);
+    nla_put (reply, OVS_VXLAN_ATTR_MAC, ETH_ALEN, macaddr);
+
+    vme = vxlan_vme_get(vni, macaddr);
+    if (vme) {
+
+        nla_put_u32(reply, OVS_VXLAN_ATTR_VTEP, vme->peer);
+        nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, 0);
+        nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "success");
+
+        hash = jhash (macaddr, ETH_ALEN, 0);
+        hh = &vxlan_mac_table [(hash & (VXLAN_MAC_TABLE_SIZE - 1))];
+
+        spin_lock (&hh->lock);
+        vxlan_vme_delete (vme, true);
+        spin_unlock (&hh->lock);
+
+        return 0;
+    }
+
+    nla_put_u32(reply, OVS_VXLAN_ATTR_STATUS_CODE, ENOENT);
+    nla_put_string(reply, OVS_VXLAN_ATTR_STATUS_STR, "entry not found");
+
+    return -ENOENT;
+}
+
+int
+ovs_vxlan_peer_dump (struct genl_family *vxlan_family,
+                     struct sk_buff *skb, struct netlink_callback *cb)
+{
+    struct vxlan_peer_entry   *pe;
+    struct hlist_node         *node;
+	struct ovs_header         *ovs_header = NULL;
+    int                        i, bucket, skip, j = 0;
+
+
+    bucket = cb->args[0];
+    skip = cb->args[1];
+
+    for (i = bucket; i < VXLAN_PEER_TABLE_SIZE; i++) {
+        hlist_for_each_entry_rcu(pe, node, &vxlan_peer_table[i], hash_node) {
+            if (j >= skip) {
+                ovs_header = genlmsg_put(skb, NETLINK_CB(cb->skb).pid,
+                                         cb->nlh->nlmsg_seq, vxlan_family,
+                                         NLM_F_MULTI, OVS_VXLAN_CMD_PEER_DUMP);
+                if (!ovs_header) {
+                    if (j > 0)
+                        goto out;
+                    goto error;
+                }
+
+                if (nla_put_u32(skb, OVS_VXLAN_ATTR_VNI, pe->vni))
+                    goto nla_put_failure;
+                if (nla_put_u32(skb, OVS_VXLAN_ATTR_VTEP, pe->peer_vtep))
+                    goto nla_put_failure;
+                if (genlmsg_end(skb, ovs_header) < 0)
+                    goto nla_put_failure;
+            }
+        }
+        j++;
+    }
+ out:
+    cb->args [0] = i;
+    cb->args [1] = j;
+
+    return skb->len;
+
+ nla_put_failure:
+    genlmsg_cancel(skb, ovs_header);
+ error:
+    return -EMSGSIZE;
+}
+
+int
+ovs_vxlan_vme_dump (struct genl_family *vxlan_family,
+                        struct sk_buff *skb, struct netlink_callback *cb)
+{
+    struct vxlan_mac_entry        *vme;
+    struct vxlan_mac_hlr_table    *hh;
+    struct hlist_node             *node;
+	struct ovs_header             *ovs_header = NULL;
+    int                            i, bucket, skip, j = 0;
+    unsigned long                  age;
+
+    bucket = cb->args[0];
+    skip = cb->args[1];
+
+    for (i = bucket; i < VXLAN_MAC_TABLE_SIZE; i++) {
+        hh = &vxlan_mac_table [i];
+        hlist_for_each_entry_rcu(vme, node, &hh->hash_table, hash_node) {
+            if (j >= skip) {
+                ovs_header = genlmsg_put(skb, NETLINK_CB(cb->skb).pid,
+                                         cb->nlh->nlmsg_seq, vxlan_family,
+                                         NLM_F_MULTI, OVS_VXLAN_CMD_VME_DUMP);
+                if (!ovs_header) {
+                    if (j > 0)
+                        goto out;
+                    goto error;
+                }
+
+                if (nla_put_u32(skb, OVS_VXLAN_ATTR_VNI, vme->vni))
+                    goto nla_put_failure;
+                if (nla_put_u32(skb, OVS_VXLAN_ATTR_VTEP, vme->peer))
+                    goto nla_put_failure;
+                if (nla_put (skb, OVS_VXLAN_ATTR_MAC, ETH_ALEN, vme->macaddr))
+                    goto nla_put_failure;
+                
+                age = (jiffies > vme->age) ? 0 : vme->age - jiffies;
+                age = jiffies_to_msecs(age);
+                if (nla_put_u32 (skb, OVS_VXLAN_ATTR_AGE, (u32)age))
+                    goto nla_put_failure;
+
+                if (genlmsg_end(skb, ovs_header) < 0)
+                    goto nla_put_failure;
+            }
+        }
+        j++;
+    }
+
+ out:
+    cb->args [0] = i;
+    cb->args [1] = j;
+
+    return skb->len;
+
+ nla_put_failure:
+    genlmsg_cancel(skb, ovs_header);
+ error:
+    return -EMSGSIZE;
+}
+
 int
 ovs_vxlan_init()
 {
@@ -1069,6 +1327,10 @@ ovs_vxlan_init()
 
     spin_lock_init (&vxlan_socket_lock);
 
+    for (i = 0; i < VXLAN_PEER_TABLE_SIZE; i++) {
+		INIT_HLIST_HEAD(&vxlan_peer_table[i]);
+    }
+
     return 0;
 }
 
@@ -1076,6 +1338,7 @@ void
 ovs_vxlan_exit()
 {
     struct vxlan_mac_entry      *vme;
+    struct vxlan_peer_entry     *pe;
     struct vxlan_mac_hlr_table  *hh;
     struct hlist_node           *node;
     int                          i;
@@ -1088,8 +1351,14 @@ ovs_vxlan_exit()
         }
         spin_unlock (&hh->lock);
     }
-
     kfree (vxlan_mac_table);
+
+    for (i = 0; i < VXLAN_PEER_TABLE_SIZE; i++) {
+        hlist_for_each_entry_rcu(pe, node, &vxlan_peer_table[i], hash_node) {
+            hlist_del_init_rcu (&pe->hash_node);
+            kfree (pe);
+        }
+    }
 }
 
 #else

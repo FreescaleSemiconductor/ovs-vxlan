@@ -2061,6 +2061,198 @@ static struct genl_ops dp_vport_genl_ops[] = {
 	},
 };
 
+/* -- VXLAN -- */
+static const struct nla_policy vxlan_policy[OVS_VXLAN_ATTR_MAX + 1] = {
+	[OVS_VXLAN_ATTR_VNI] =  { .type = NLA_U32 },
+	[OVS_VXLAN_ATTR_VTEP] = { .type = NLA_U32 },
+	[OVS_VXLAN_ATTR_MAC] =  { .type = NLA_STRING },
+	[OVS_VXLAN_ATTR_STATUS_CODE] =  { .type = NLA_U32 },
+	[OVS_VXLAN_ATTR_STATUS_STR] =  { .type = NLA_STRING },
+};
+
+static struct genl_family dp_vxlan_genl_family = {
+	.id = GENL_ID_GENERATE,
+	.hdrsize = sizeof(struct ovs_header),
+	.name = OVS_VXLAN_FAMILY,
+	.version = OVS_VXLAN_VERSION,
+	.maxattr = OVS_VXLAN_ATTR_MAX,
+	 SET_NETNSOK
+};
+
+static struct genl_multicast_group ovs_dp_vxlan_multicast_group = {
+	.name = OVS_VXLAN_MCGROUP
+};
+
+static int ovs_vxlan_cmd_peer_new(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr **a = info->attrs;
+	struct sk_buff *reply;
+	struct ovs_header *ovs_header;
+	int err;
+    uint32_t vni;
+    __be32 vtep;
+
+	err = -EINVAL;
+    
+	if (!a[OVS_VXLAN_ATTR_VTEP] || !a[OVS_VXLAN_ATTR_VNI])
+		goto exit;
+
+    reply = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+    if (reply == NULL) {
+        err = -ENOMEM;
+        goto exit;
+    }
+
+    vni  = nla_get_u32(a[OVS_VXLAN_ATTR_VNI]);
+    vtep = nla_get_u32(a[OVS_VXLAN_ATTR_VTEP]);
+
+	ovs_header = genlmsg_put(reply, info->snd_pid, info->snd_seq,
+                             &dp_vxlan_genl_family, 0, OVS_VXLAN_CMD_PEER_NEW);
+	rtnl_lock();
+    err = ovs_vxlan_peer_add (vni, vtep, reply);
+	rtnl_unlock();
+
+    genlmsg_end(reply, ovs_header);
+    genl_notify(reply, genl_info_net(info), info->snd_pid,
+                ovs_dp_vxlan_multicast_group.id, info->nlhdr, GFP_KERNEL);
+
+    err = 0;
+
+exit:
+	return err;
+}
+
+static int ovs_vxlan_cmd_peer_del(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr **a = info->attrs;
+	struct sk_buff *reply;
+	struct ovs_header *ovs_header;
+	int err;
+    uint32_t vni;
+    __be32 peer_vtep;
+
+	err = -EINVAL;
+    
+	if (!a[OVS_VXLAN_ATTR_VNI] || !a[OVS_VXLAN_ATTR_VTEP])
+		goto exit;
+
+    reply = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+    if (reply == NULL) {
+        err = -ENOMEM;
+        goto exit;
+    }
+
+	ovs_header = genlmsg_put(reply, info->snd_pid, info->snd_seq,
+                             &dp_vxlan_genl_family, 0, OVS_VXLAN_CMD_PEER_DEL);
+
+    vni  = nla_get_u32(a[OVS_VXLAN_ATTR_VNI]);
+    peer_vtep = nla_get_u32(a[OVS_VXLAN_ATTR_VTEP]);
+
+	rtnl_lock();
+    ovs_vxlan_peer_del (vni, peer_vtep, reply);
+	rtnl_unlock();
+
+    genlmsg_end(reply, ovs_header);
+
+    genl_notify(reply, genl_info_net(info), info->snd_pid,
+                ovs_dp_vxlan_multicast_group.id, info->nlhdr, GFP_KERNEL);
+    err = 0;
+
+exit:
+	return err;
+}
+
+static int ovs_vxlan_cmd_vme_del(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr **a = info->attrs;
+	struct sk_buff *reply;
+    struct ovs_header *ovs_header;
+	int err;
+    uint32_t  vni;
+    uint8_t mac[ETH_ALEN];
+
+	err = -EINVAL;
+    
+	if (!a[OVS_VXLAN_ATTR_VTEP] || !a[OVS_VXLAN_ATTR_VNI])
+		goto exit;
+
+    reply = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+    if (reply == NULL) {
+        err = -ENOMEM;
+        goto exit;
+    }
+	ovs_header = genlmsg_put(reply, info->snd_pid, info->snd_seq,
+                             &dp_vxlan_genl_family, 0, OVS_VXLAN_CMD_VME_DEL);
+
+    vni = nla_get_u32(a[OVS_VXLAN_ATTR_VNI]);
+    nla_memcpy (mac, a[OVS_VXLAN_ATTR_MAC], ETH_ALEN);
+
+	rtnl_lock();
+    ovs_vxlan_vme_del (vni, mac, reply);
+	rtnl_unlock();
+    
+    genlmsg_end(reply, ovs_header);
+    genl_notify(reply, genl_info_net(info), info->snd_pid,
+                ovs_dp_vxlan_multicast_group.id, info->nlhdr, GFP_KERNEL);
+
+    err = 0;
+exit:
+	return err;
+}
+
+
+static int ovs_vxlan_cmd_peer_dump(struct sk_buff *skb,
+                                  struct netlink_callback *cb)
+{
+    int err = 0;
+
+    rcu_read_lock ();
+    err = ovs_vxlan_peer_dump(&dp_vxlan_genl_family, skb, cb);
+    rcu_read_unlock ();
+
+    return err;
+}
+
+static int ovs_vxlan_cmd_vme_dump(struct sk_buff *skb,
+                                  struct netlink_callback *cb)
+{
+    int err = 0;
+
+    rcu_read_lock ();
+    err = ovs_vxlan_vme_dump(&dp_vxlan_genl_family, skb, cb);
+    rcu_read_unlock ();
+
+    return err;
+}
+
+static struct genl_ops dp_vxlan_genl_ops[] = {
+	{ .cmd = OVS_VXLAN_CMD_PEER_NEW,
+	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+	  .policy = vxlan_policy,
+	  .doit = ovs_vxlan_cmd_peer_new
+	},
+	{ .cmd = OVS_VXLAN_CMD_PEER_DEL,
+	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+	  .policy = vxlan_policy,
+	  .doit = ovs_vxlan_cmd_peer_del
+	},
+	{ .cmd = OVS_VXLAN_CMD_VME_DEL,
+	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+	  .policy = vxlan_policy,
+	  .doit = ovs_vxlan_cmd_vme_del
+	},
+	{ .cmd = OVS_VXLAN_CMD_VME_DUMP,
+	  .flags = 0,
+	  .policy = vxlan_policy,
+	  .dumpit = ovs_vxlan_cmd_vme_dump
+	},
+	{ .cmd = OVS_VXLAN_CMD_PEER_DUMP,
+	  .flags = 0,
+	  .policy = vxlan_policy,
+	  .dumpit = ovs_vxlan_cmd_peer_dump
+	},
+};
+
 struct genl_family_and_ops {
 	struct genl_family *family;
 	struct genl_ops *ops;
@@ -2081,6 +2273,9 @@ static const struct genl_family_and_ops dp_genl_families[] = {
 	{ &dp_packet_genl_family,
 	  dp_packet_genl_ops, ARRAY_SIZE(dp_packet_genl_ops),
 	  NULL },
+    { &dp_vxlan_genl_family,
+	  dp_vxlan_genl_ops, ARRAY_SIZE(dp_vxlan_genl_ops),
+	  &ovs_dp_vxlan_multicast_group },
 };
 
 static void dp_unregister_genl(int n_families)

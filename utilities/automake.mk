@@ -3,7 +3,8 @@ bin_PROGRAMS += \
 	utilities/ovs-controller \
 	utilities/ovs-dpctl \
 	utilities/ovs-ofctl \
-	utilities/ovs-vsctl
+	utilities/ovs-vsctl \
+	utilities/ovs-vxctl
 bin_SCRIPTS += utilities/ovs-pki utilities/ovs-parse-leaks
 if HAVE_PYTHON
 bin_SCRIPTS += \
@@ -46,7 +47,8 @@ MAN_ROOTS += \
 	utilities/ovs-vlan-bug-workaround.8.in \
 	utilities/ovs-test.8.in \
 	utilities/ovs-vlan-test.8.in \
-	utilities/ovs-vsctl.8.in
+	utilities/ovs-vsctl.8.in \
+	utilities/ovs-vxctl.8.in
 MAN_FRAGMENTS += utilities/ovs-vlan-bugs.man
 DISTCLEANFILES += \
 	utilities/ovs-appctl.8 \
@@ -71,7 +73,8 @@ DISTCLEANFILES += \
 	utilities/ovs-vlan-test \
 	utilities/ovs-vlan-test.8 \
 	utilities/ovs-vlan-bug-workaround.8 \
-	utilities/ovs-vsctl.8
+	utilities/ovs-vsctl.8 \
+	utilities/ovs-vxctl.8
 
 man_MANS += \
 	utilities/ovs-appctl.8 \
@@ -87,7 +90,8 @@ man_MANS += \
 	utilities/ovs-vlan-bug-workaround.8 \
 	utilities/ovs-test.8 \
 	utilities/ovs-vlan-test.8 \
-	utilities/ovs-vsctl.8
+	utilities/ovs-vsctl.8 \
+	utilities/ovs-vxctl.8
 dist_man_MANS += utilities/ovs-ctl.8
 
 utilities_ovs_appctl_SOURCES = utilities/ovs-appctl.c
@@ -108,6 +112,7 @@ utilities_ovs_ofctl_LDADD = \
 utilities_ovs_vsctl_SOURCES = utilities/ovs-vsctl.c
 utilities_ovs_vsctl_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
 
+
 if HAVE_NETLINK
 sbin_PROGRAMS += utilities/ovs-vlan-bug-workaround
 utilities_ovs_vlan_bug_workaround_SOURCES = utilities/ovs-vlan-bug-workaround.c
@@ -116,6 +121,9 @@ utilities_ovs_vlan_bug_workaround_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
 noinst_PROGRAMS += utilities/nlmon
 utilities_nlmon_SOURCES = utilities/nlmon.c
 utilities_nlmon_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
+
+utilities_ovs_vxctl_SOURCES = utilities/ovs-vxctl.c
+utilities_ovs_vxctl_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
 endif
 
 bin_PROGRAMS += utilities/ovs-benchmark

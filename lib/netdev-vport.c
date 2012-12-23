@@ -1082,7 +1082,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
         }
     }
 
-    if (vtep != 0 && vni != 0 && mcast_ip != 0) {
+    if (vtep != 0 && vni != 0) {
         __be64  nvni = htonll(vni);
         nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, vtep);
         nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, mcast_ip);
@@ -1092,11 +1092,9 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
                 nvni, vtep, mcast_ip);
     }
     else {
-        VLOG_ERR("Configure options: VNI, VTEP, MULTICAST IP. "
-                "MISSING: %s %s %s",
-                (vni != 0) ? "VNI " : " ",
-                (vtep != 0) ? "VTEP " : " ",
-                (mcast_ip != 0) ? "VXLAN MULTICAST IP" : " ");
+        VLOG_ERR("Configure options: VNI & VTEP are required MISSING: %s %s ",
+                 (vni != 0) ? "VNI " : " ",
+                 (vtep != 0) ? "VTEP " : " ");
         return EINVAL;
     }
 

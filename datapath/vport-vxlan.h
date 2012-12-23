@@ -52,11 +52,13 @@ struct vxlanhdr {
 };
 
 
+#if 0
 enum {
     VXLAN_MAC_ENTRY_FLAGS_NONE = (0),
     VXLAN_MAC_ENTRY_FLAGS_LEARNED = (1 << 0),
     VXLAN_MAC_ENTRY_FLAGS_CONFIGURED = (1 << 1),
 };
+#endif
 
 struct vxlan_mac_entry {
     struct rcu_head    rcu;
@@ -65,7 +67,6 @@ struct vxlan_mac_entry {
 	u32                vni;
     __be32             peer; 
     unsigned long      age;
-    u16                flags;
     u8                 macaddr[ETH_ALEN];
 };
 
@@ -82,9 +83,15 @@ static inline int vxlan_hdr_len(const struct tnl_mutable_config *mutable)
 	return VXLAN_HLEN;
 }
 
+struct genl_family;
 
 int ovs_vxlan_init (void);
 void ovs_vxlan_exit (void);
+int ovs_vxlan_peer_add (u32 vni, __be32 peer_vtep, struct sk_buff *reply);
+int ovs_vxlan_peer_del (u32 vni, __be32 peer_vtep, struct sk_buff *reply);
+int ovs_vxlan_vme_del (u32 vni, u8 *macaddr, struct sk_buff *reply);
+int ovs_vxlan_peer_dump (struct genl_family *vxlan_family, struct sk_buff *skb, struct netlink_callback *cb);
+int ovs_vxlan_vme_dump (struct genl_family *vxlan_family, struct sk_buff *skb, struct netlink_callback *cb);
 
 #endif /* VPORT_VXLAN_H */
 
