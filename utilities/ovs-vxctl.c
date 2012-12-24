@@ -382,7 +382,7 @@ print_vme (struct vxlan_nl_data *reply, char *msg)
 {
     char *str = (msg) ? msg : "";
 
-    printf ("%s\"%s\". vni=%d, vtep="IP_FMT", macaddr="ETH_ADDR_FMT"\n",
+    printf ("%s\"%s\". vni=%-3d,  vtep="IP_FMT ",  macaddr="ETH_ADDR_FMT"\n",
             str, reply->status_str, reply->vni, IP_ARGS(&reply->vtep.s_addr),
             ETH_ADDR_ARGS(reply->mac));
 }
@@ -443,8 +443,10 @@ vxctl_dump_vme (int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         bzero (&d, sizeof(d));
         vxlan_parse_nl_reply (&reply, &d);
         age = (float)d.age/1000.0;
-        printf ("    vni=%d    vtep="IP_FMT"    macaddr="ETH_ADDR_FMT"    age=%fsec(%u)\n",
-                d.vni, IP_ARGS(&d.vtep.s_addr), ETH_ADDR_ARGS(d.mac), age, d.age);
+        printf ("    vni=%-3d    vtep="IP_FMT
+                "    macaddr="ETH_ADDR_FMT
+                "    age=%-'.3fsec\n",
+                d.vni, IP_ARGS(&d.vtep.s_addr), ETH_ADDR_ARGS(d.mac), age);
         i++;
     }
     nl_dump_done (&dump);
