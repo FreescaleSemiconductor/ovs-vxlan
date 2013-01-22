@@ -53,6 +53,7 @@ EXTRA_DIST = \
 	IntegrationGuide \
 	NOTICE \
 	PORTING \
+	README-ovs \
 	README-gcov \
 	REPORTING-BUGS \
 	SubmittingPatches \
