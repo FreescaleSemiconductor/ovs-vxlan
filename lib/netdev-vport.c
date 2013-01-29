@@ -974,7 +974,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
     ovs_be32 mcast_ip = htonl(0);
     uint64_t vni = 0;
 
-    supports_csum = !strcmp(type, "gre") || !strcmp(type, "ipsec_gre");
+    supports_csum = !strcmp(type, "vxlan") || !strcmp(type, "ipsec_vxlan");
     is_ipsec = !strncmp(type, "ipsec_", 6);
 
     flags = TNL_F_DF_DEFAULT | TNL_F_PMTUD | TNL_F_HDR_CACHE;
@@ -1082,7 +1082,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
         }
     }
 
-    if (vtep != 0 && vni != 0) {
+    if (vni != 0) {
         __be64  nvni = htonll(vni);
         nl_msg_put_be32(options, OVS_TUNNEL_ATTR_SRC_IPV4, vtep);
         nl_msg_put_be32(options, OVS_TUNNEL_ATTR_DST_IPV4, mcast_ip);
@@ -1092,9 +1092,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
                 nvni, vtep, mcast_ip);
     }
     else {
-        VLOG_ERR("Configure options: VNI & VTEP are required MISSING: %s %s ",
-                 (vni != 0) ? "VNI " : " ",
-                 (vtep != 0) ? "VTEP " : " ");
+        VLOG_ERR("VNI is required for VXLAN");
         return EINVAL;
     }
 
@@ -1107,9 +1105,9 @@ static int
 tnl_vxlan_port_config_from_nlattr(const struct nlattr *options, 
         size_t options_len, struct nlattr *a[OVS_TUNNEL_ATTR_MAX + 1])
 {
-    static const struct nl_policy ovs_tunnel_policy[] = {
+    static const struct nl_policy ovs_vxlan_tunnel_policy[] = {
         [OVS_TUNNEL_ATTR_FLAGS] = { .type = NL_A_U32 },
-        [OVS_TUNNEL_ATTR_SRC_IPV4] = { .type = NL_A_BE32 },
+        [OVS_TUNNEL_ATTR_SRC_IPV4] = { .type = NL_A_BE32, .optional = true },
         [OVS_TUNNEL_ATTR_DST_IPV4] = { .type = NL_A_BE32, .optional = true },
         [OVS_TUNNEL_ATTR_IN_KEY] = { .type = NL_A_BE64 },
         [OVS_TUNNEL_ATTR_TOS] = { .type = NL_A_U8, .optional = true },
@@ -1120,8 +1118,8 @@ tnl_vxlan_port_config_from_nlattr(const struct nlattr *options,
     struct ofpbuf buf;
 
     ofpbuf_use_const(&buf, options, options_len);
-    if (!nl_policy_parse(&buf, 0, ovs_tunnel_policy,
-                         a, ARRAY_SIZE(ovs_tunnel_policy))) {
+    if (!nl_policy_parse(&buf, 0, ovs_vxlan_tunnel_policy,
+                         a, ARRAY_SIZE(ovs_vxlan_tunnel_policy))) {
         return EINVAL;
     }
 
@@ -1146,8 +1144,10 @@ unparse_vxlan_tunnel_config(const char *name OVS_UNUSED,
         return error;
     }
 
-    addr = nl_attr_get_be32(a[OVS_TUNNEL_ATTR_SRC_IPV4]);
-    smap_add_format(args, "vtep", IP_FMT, IP_ARGS(&addr));
+    if (nl_attr_get_be32(a[OVS_TUNNEL_ATTR_SRC_IPV4])) {
+        addr = nl_attr_get_be32(a[OVS_TUNNEL_ATTR_SRC_IPV4]);
+        smap_add_format(args, "vtep", IP_FMT, IP_ARGS(&addr));
+    }
 
     in_key = get_be64_or_zero(a[OVS_TUNNEL_ATTR_IN_KEY]);
     smap_add_format(args, "vni", "%"PRIu64, in_key);

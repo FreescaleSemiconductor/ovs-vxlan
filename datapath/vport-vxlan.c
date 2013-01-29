@@ -331,31 +331,79 @@ vxlan_vme_cleaner(struct work_struct *work)
                           msecs_to_jiffies (VXLAN_MAC_AGEOUT_INTERVAL));
 }
 
-
 static int
-vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr, 
-                       u16 port, struct tnl_socket **retnl_socket, int *mlink)
+vxlan_mc_join (struct sock *sk, __be32 addr, int *mlink)
 {
-    struct net_device   *dev;
-    struct tnl_socket   *tnl_socket;
     struct rtable       *rt;
-    struct sock         *sk;
-    struct socket       *socket;
-    struct sockaddr_in   sin;
-    int                  err;
+    struct net_device   *dev;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
 	struct flowi fl;
 #else
     struct flowi4 fl;
 #endif
 
+    memset(&fl, 0, sizeof(fl));
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+    fl.nl_u.ip4_u.daddr = addr;
+    fl.nl_u.ip4_u.saddr = INADDR_ANY;
+    fl.proto = IPPROTO_UDP;
+    if (ip_route_output_key(sock_net(sk), &rt, &fl)) {
+        pr_warn ("vxlan: Multicast Route error. ADDR=0x%x, rt=%p", addr, rt);
+        return -EHOSTUNREACH;
+    }
+#else
+    fl.daddr = addr;
+    fl.saddr = INADDR_ANY;
+    fl.flowi4_proto = IPPROTO_UDP;
+    rt = ip_route_output_key(sock_net(sk), &fl);
+
+    if (IS_ERR (rt)) {
+        pr_warn ("vxlan: Multicast Route error. ADDR=0x%x, rt=%p", addr, rt);
+        return -EHOSTUNREACH;
+    }
+#endif
+    dev = rt_dst(rt).dev;
+    ip_rt_put(rt);
+    if (__in_dev_get_rtnl(dev) == NULL) {
+        pr_warn ("vxlan: Multicast addr error. ADDR=0x%x, rt=%p", 
+                 addr, rt);
+        return -EADDRNOTAVAIL;
+    }
+
+    *mlink = dev->ifindex;
+    ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
+
+    OVS_VXLAN_DEBUG("vxlan: Multicast interface: %s", dev->name);
+
+    return 0;
+}
+
+static int
+vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr, 
+                       u16 port, struct tnl_socket **retnl_socket, int *mlink)
+{
+    struct tnl_socket   *tnl_socket;
+    struct sock         *sk;
+    struct socket       *socket;
+    struct sockaddr_in   sin;
+    int                  err;
+
     OVS_VXLAN_DEBUG("Trying to Create a socket: 0x%x:%d", addr, port);
 
 	list_for_each_entry_rcu(tnl_socket, &vxlan_socket_list, node) {
         socket = tnl_socket->socket;
-        if ((SOCK_SADDR(socket->sk) == addr) &&
+        if (((SOCK_SADDR(socket->sk) == addr) ||
+             (SOCK_SADDR(socket->sk) == INADDR_ANY)) &&
                 (SOCK_SPORT(socket->sk) == htons(port))) {
+
             OVS_VXLAN_DEBUG("Found existing socket: 0x%x:%d", addr, port);
+            if (ipv4_is_multicast(addr) == true) {
+                err = vxlan_mc_join ((socket->sk), addr, mlink);
+                if (err != 0) {
+                    return err;
+                }
+            }
             atomic_inc (&tnl_socket->refcount);
             *retnl_socket = tnl_socket;
             return 0;
@@ -392,42 +440,9 @@ vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
         udp_sk(sk)->encap_rcv = vxlan_rcv;
     }
     else {
-        memset(&fl, 0, sizeof(fl));
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
-        fl.nl_u.ip4_u.daddr = addr;
-        fl.nl_u.ip4_u.saddr = mutable->vtep;
-        fl.proto = IPPROTO_UDP;
-        if (ip_route_output_key(sock_net(sk), &rt, &fl)) {
-            pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
-                    mutable->vtep, addr, rt);
-            err = -EHOSTUNREACH;
+        if (vxlan_mc_join (sk, addr, mlink) != 0)
             goto error;
-        }
-#else
-        fl.daddr = addr;
-        fl.saddr = mutable->vtep;
-        fl.flowi4_proto = IPPROTO_UDP;
-        rt = ip_route_output_key(sock_net(sk), &fl);
-
-        if (IS_ERR (rt)) {
-            pr_warn ("vxlan: Multicast Route error. SRC=0x%x, DST=0x%x, rt=%p", 
-                    mutable->vtep, addr, rt);
-            err = -EHOSTUNREACH;
-            goto error;
-        }
-#endif
-        dev = rt_dst(rt).dev;
-        ip_rt_put(rt);
-        if (__in_dev_get_rtnl(dev) == NULL) {
-            err = -EADDRNOTAVAIL;
-            goto error;
-        }
-
         udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
-        *mlink = dev->ifindex;
-        ip_mc_inc_group(__in_dev_get_rtnl(dev), addr);
-        //inet_sk(sk)->mc_loop = 0;
-        OVS_VXLAN_DEBUG("vxlan: Multicast interface: %s", dev->name);
     }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
