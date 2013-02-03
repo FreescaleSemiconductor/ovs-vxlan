@@ -59,7 +59,6 @@ enum {
 	OVS_TUNNEL_ATTR_TTL,        /* 8-bit TTL value. */
 
 	OVS_TUNNEL_ATTR_VTEP_PORT,  /* VTEP UDP port to bind on. */
-    OVS_TUNNEL_ATTR_MCAST_PORT, /* Mulitcast UDP port for broadcast messages */
 
 	__OVS_TUNNEL_ATTR_MAX
 };

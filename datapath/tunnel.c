@@ -287,26 +287,6 @@ struct vport * ovs_tnl_port_table_lookup(struct port_lookup_key *key,
 	return NULL;
 }
 
-void ovs_tnl_port_table_dump ()
-{
-    int  i;
-
-	for (i = 0; i < PORT_TABLE_SIZE; i++) {
-		struct hlist_node *n;
-		struct hlist_head *bucket;
-		struct tnl_vport *tnl_vport;
-
-		bucket = &port_table[i];
-		hlist_for_each_entry_rcu(tnl_vport, n, bucket, hash_node) {
-		    struct tnl_mutable_config *mutable;
-            mutable = rcu_dereference_rtnl(tnl_vport->mutable);
-            pr_warn ("KEY: 0x%llx, NET: %p, TYPE: 0x%x",
-                    mutable->key.in_key, mutable->key.net, 
-                    mutable->key.tunnel_type);
-        }
-	}
-}
-
 
 struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 				__be64 key, int tunnel_type,

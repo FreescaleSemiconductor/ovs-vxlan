@@ -134,8 +134,7 @@ struct tnl_mutable_config {
     u32               vni;
     __be32            vtep;
     __be32            mcast_ip;
-    u16               vtep_port;
-    u16               mcast_port;
+    u16               udp_port;
 };
 
 struct tnl_ops {
@@ -330,7 +329,6 @@ void ovs_tnl_assign_config_rcu(struct vport *vport,
 			      struct tnl_mutable_config *new_config);
 void ovs_tnl_free_config_rcu(struct rcu_head *rcu);
 void ovs_tnl_free_mutable_rtnl(struct tnl_mutable_config *mutable);
-void ovs_tnl_port_table_dump (void);
 
 int ovs_tnl_init(void);
 void ovs_tnl_exit(void);

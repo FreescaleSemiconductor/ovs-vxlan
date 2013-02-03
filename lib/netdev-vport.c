@@ -1003,7 +1003,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
                         "16777215(0xFFFFFF). %llu", (uint64_t)vni);
                 return EINVAL;
             } 
-        } else if (strcmp(node->key, "vtep_udp_port") == 0) {
+        } else if (strcmp(node->key, "udp_port") == 0) {
             nl_msg_put_u16(options, OVS_TUNNEL_ATTR_VTEP_PORT,
                     atoi(node->value));
         } else if (strcmp(node->key, "mcast_ip") == 0) {
@@ -1019,10 +1019,6 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
                             node->key, node->value);
                 }
             }
-        } else if (strcmp(node->key, "mcast_udp_port") == 0) {
-            nl_msg_put_u16(options, OVS_TUNNEL_ATTR_MCAST_PORT,
-                    atoi(node->value));
-
         } else if (!strcmp(node->key, "peer_cert") && is_ipsec) {
             if (smap_get(args, "certificate")) {
                 ipsec_mech_set = true;
@@ -1113,7 +1109,6 @@ tnl_vxlan_port_config_from_nlattr(const struct nlattr *options,
         [OVS_TUNNEL_ATTR_TOS] = { .type = NL_A_U8, .optional = true },
         [OVS_TUNNEL_ATTR_TTL] = { .type = NL_A_U8, .optional = true },
         [OVS_TUNNEL_ATTR_VTEP_PORT] = { .type = NL_A_U16, .optional=true },
-        [OVS_TUNNEL_ATTR_MCAST_PORT] = { .type = NL_A_U16, .optional=true },
     };
     struct ofpbuf buf;
 
@@ -1159,12 +1154,7 @@ unparse_vxlan_tunnel_config(const char *name OVS_UNUSED,
 
     if (a[OVS_TUNNEL_ATTR_VTEP_PORT]) {
         port = nl_attr_get_u16(a[OVS_TUNNEL_ATTR_VTEP_PORT]);
-        smap_add_format(args, "vtep_udp_port", "%d", port);
-    }
-
-    if (a[OVS_TUNNEL_ATTR_MCAST_PORT]) {
-        port = nl_attr_get_u16(a[OVS_TUNNEL_ATTR_MCAST_PORT]);
-        smap_add_format(args, "mcast_udp_port", "%d", port);
+        smap_add_format(args, "udp_port", "%d", port);
     }
     
     unparse_tunnel_config_flags_ttl_tos(args, a);

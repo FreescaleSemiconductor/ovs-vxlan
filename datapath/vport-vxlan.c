@@ -622,7 +622,6 @@ static const struct nla_policy vxlan_nl_policy[OVS_TUNNEL_ATTR_MAX + 1] = {
     [OVS_TUNNEL_ATTR_DST_IPV4]     = { .type = NLA_U32 },
 	[OVS_TUNNEL_ATTR_VTEP_PORT]    = { .type = NLA_U16 },
     [OVS_TUNNEL_ATTR_IN_KEY]       = { .type = NLA_U64 },
-    [OVS_TUNNEL_ATTR_MCAST_PORT]   = { .type = NLA_U16 },
 };
 
 static int
@@ -666,14 +665,9 @@ vxlan_parse_options (struct tnl_mutable_config *mutable,
 		mutable->ttl = nla_get_u8(a[OVS_TUNNEL_ATTR_TTL]);
 
     if (a[OVS_TUNNEL_ATTR_VTEP_PORT])
-        mutable->vtep_port = nla_get_u16(a[OVS_TUNNEL_ATTR_VTEP_PORT]);
+        mutable->udp_port = nla_get_u16(a[OVS_TUNNEL_ATTR_VTEP_PORT]);
     else
-        mutable->vtep_port = VXLAN_UDP_PORT;
-
-    if (a[OVS_TUNNEL_ATTR_MCAST_PORT])
-        mutable->mcast_port = nla_get_u16(a[OVS_TUNNEL_ATTR_MCAST_PORT]);
-    else
-        mutable->mcast_port = VXLAN_MCAST_PORT;
+        mutable->udp_port = VXLAN_UDP_PORT;
         
 	return 0;
 }
@@ -727,8 +721,8 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
     }
 
     if ((mutable->vtep != old_mutable->vtep) ||
-        (mutable->vtep_port != old_mutable->vtep_port)) {
-        err = vxlan_open_tnl_socket (mutable, mutable->vtep, mutable->vtep_port,
+        (mutable->udp_port != old_mutable->udp_port)) {
+        err = vxlan_open_tnl_socket (mutable, mutable->vtep, mutable->udp_port,
                                    &rcv_socket, &mlink);
         if (err != 0) {
             goto error;
@@ -739,10 +733,10 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
     }
 
     if ((mutable->mcast_ip != old_mutable->mcast_ip) ||
-        (mutable->mcast_port != old_mutable->mcast_port)) {
+        (mutable->udp_port != old_mutable->udp_port)) {
         if (mutable->mcast_ip != 0) {
             err = vxlan_open_tnl_socket (mutable, mutable->mcast_ip, 
-                                         mutable->mcast_port,
+                                         mutable->udp_port,
                                          &mcast_socket, &mlink);
             if (err != 0) {
                 goto sock_free;
@@ -825,16 +819,13 @@ vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
 	if (nla_put_be32(skb, OVS_TUNNEL_ATTR_SRC_IPV4, mutable->vtep))
 		goto nla_put_failure;
 
-	if (nla_put_u16(skb, OVS_TUNNEL_ATTR_VTEP_PORT, mutable->vtep_port))
+	if (nla_put_u16(skb, OVS_TUNNEL_ATTR_VTEP_PORT, mutable->udp_port))
 		goto nla_put_failure;
 
 	if (nla_put_be64(skb, OVS_TUNNEL_ATTR_IN_KEY, cpu_to_be64(mutable->vni)))
 		goto nla_put_failure;
 
 	if (nla_put_be32(skb, OVS_TUNNEL_ATTR_DST_IPV4, mutable->mcast_ip))
-        goto nla_put_failure;
-
-    if (nla_put_u16(skb, OVS_TUNNEL_ATTR_MCAST_PORT, mutable->mcast_port))
         goto nla_put_failure;
 
 	return 0;
@@ -861,15 +852,21 @@ vxlan_build_header(const struct vport *vport,
 static struct sk_buff *
 vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
-					struct dst_entry *dst, struct sk_buff *skb)
+					struct dst_entry *dst,
+                    struct sk_buff *skb)
 {
 	struct udphdr    *udph = udp_hdr(skb);
 	struct vxlanhdr  *vxh = (struct vxlanhdr *)(udph + 1);
 
-	if (mutable->flags & TNL_F_OUT_KEY_ACTION)
-		vxh->vx_vni = htonl(mutable->vni);
+    vxh->vx_vni = htonl(mutable->vni);
+#if 0
+	if (mutable->flags & TNL_F_OUT_KEY_ACTION) {
+        u32 vni = (u32)(be64_to_cpu(OVS_CB(skb)->tun_id) & 0x00FFFFFF);
+        vxh->vx_vni = htonl(vni);
+    }
+#endif
 
-	udph->source = htons(mutable->vtep_port); 
+	udph->source = htons(mutable->udp_port); 
 	udph->dest = htons(OVS_CB(skb)->vxlan_udp_port);
 	udph->len = htons(skb->len - skb_transport_offset(skb));
 
@@ -901,12 +898,13 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
 	eh        = eth_hdr(skb);
 	iph       = ip_hdr(skb);
 
+
     OVS_CB(skb)->tun_ipv4_src = mutable->vtep;
+    OVS_CB(skb)->vxlan_udp_port = mutable->udp_port;
 
     vme = vxlan_vme_get(mutable->vni, eh->h_dest);
     if (vme) {
         OVS_CB(skb)->tun_ipv4_dst = vme->peer;
-        OVS_CB(skb)->vxlan_udp_port = mutable->vtep_port;
         return ovs_tnl_send (vport, skb);
     }
 
@@ -916,7 +914,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
          * where we want to do the multicast.
          */
         OVS_CB(skb)->tun_ipv4_dst = mutable->mcast_ip;
-        OVS_CB(skb)->vxlan_udp_port = mutable->mcast_port;
+
         return ovs_tnl_send (vport, skb);
     }
 
@@ -933,7 +931,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
                 struct sk_buff *skb_cloned = skb_clone (skb, GFP_ATOMIC);
                 if (skb_cloned) {
                     OVS_CB(skb_cloned)->tun_ipv4_dst = pe->peer_vtep;
-                    OVS_CB(skb_cloned)->vxlan_udp_port = mutable->vtep_port;
+                    OVS_CB(skb_cloned)->vxlan_udp_port = mutable->udp_port;
                     ovs_tnl_send (vport, skb_cloned);
                     vxmesh_sent = true;
                 }
@@ -1007,7 +1005,6 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 
     vport = ovs_tnl_port_table_lookup (&key, &m);
 	if (unlikely(vport == NULL)) {
-        ovs_tnl_port_table_dump ();
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
 	}
