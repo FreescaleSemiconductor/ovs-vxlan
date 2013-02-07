@@ -988,22 +988,23 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
     struct port_lookup_key            key;
     u32                               vni;
 
-	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN)))
+	if (unlikely(!pskb_may_pull(skb, VXLAN_HLEN + ETH_HLEN))) {
 		goto error;
+    }
 
 	iph = ip_hdr(skb);
 	vxh = vxlan_hdr(skb);
-
     vni = ntohl(vxh->vx_vni);
+
     OVS_VXLAN_DEBUG("vxlan_rcv_process: %s: SRC: 0x%x, DST: 0x%x, vni: %d",
                     (ipv4_is_multicast(iph->daddr) ? "MCAST" : "NORMAL"),
                     iph->saddr, iph->daddr, vni);
 
 	if (unlikely((vxh->vx_flags != htonl(VXLAN_FLAGS)) ||
                  (vni & 0xFF000000))) {
-        pr_warn ("Bad vxlan header: vx_flags: 0x%x:0x%x, vni=0x%x",
-                 vxh->vx_flags, htonl(VXLAN_FLAGS),
-                 vni);
+        OVS_VXLAN_DEBUG ("Bad vxlan header: vx_flags: 0x%x:0x%x, vni=0x%x",
+                         vxh->vx_flags, htonl(VXLAN_FLAGS),
+                         vni);
 		goto error;
     }
 
