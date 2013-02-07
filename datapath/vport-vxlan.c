@@ -70,6 +70,7 @@
 #else
 #define OVS_VXLAN_VME_DEBUG(fmt, arg...) (void)0
 #endif
+//#define VXLAN_VME_UT (1)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
 #define SOCK_SADDR(sk) (inet_sk(sk)->rcv_saddr)
@@ -97,8 +98,6 @@ static void vxlan_destroy(struct vport *vport);
 static int vxlan_set_options(struct vport *vport, struct nlattr *options);
 static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb);
 static int vxlan_send(struct vport *vport, struct sk_buff *skb);
-static int vxlan_rcv(struct sock *sk, struct sk_buff *skb);
-static int vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb);
 static struct vxlan_mac_entry *vxlan_vme_get (u32 vni, u8 *macaddr);
 static struct sk_buff * vxlan_update_header(const struct vport *vport,
                     const struct tnl_mutable_config *mutable,
@@ -110,6 +109,7 @@ static int vxlan_set_config (struct vport *vport, struct nlattr *options,
         struct tnl_mutable_config  *old_mutable);
 static void vxlan_vme_cleaner(struct work_struct *work);
 static bool vxlan_peer_check (u32 vni, __be32 peer);
+static int vxlan_rcv_process (struct sock *sk, struct sk_buff *skb);
 
 
 const struct vport_ops ovs_vxlan_vport_ops = {
@@ -258,7 +258,6 @@ vxlan_vme_get (u32 vni, u8 *macaddr)
     return NULL;
 }
 
-//#define VXLAN_VME_UT (1)
 #ifdef VXLAN_VME_UT
 static void
 vxlan_vme_ut_add_entries (int count)
@@ -397,7 +396,9 @@ vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
              (SOCK_SADDR(socket->sk) == INADDR_ANY)) &&
                 (SOCK_SPORT(socket->sk) == htons(port))) {
 
-            OVS_VXLAN_DEBUG("Found existing socket: 0x%x:%d", addr, port);
+            OVS_VXLAN_DEBUG("Found existing socket: 0x%x:%d",
+                            SOCK_SADDR(socket->sk),
+                            ntohs((SOCK_SPORT(socket->sk))));
             if (ipv4_is_multicast(addr) == true) {
                 err = vxlan_mc_join ((socket->sk), addr, mlink);
                 if (err != 0) {
@@ -435,19 +436,16 @@ vxlan_open_tnl_socket (struct tnl_mutable_config *mutable, __be32 addr,
 
     sk = (socket)->sk;
 	udp_sk(sk)->encap_type = UDP_ENCAP_VXLAN;
-
-    if (ipv4_is_multicast(addr) == false) {
-        udp_sk(sk)->encap_rcv = vxlan_rcv;
-    }
-    else {
-        if (vxlan_mc_join (sk, addr, mlink) != 0)
-            goto error;
-        udp_sk(sk)->encap_rcv = vxlan_mcast_rcv;
-    }
+    udp_sk(sk)->encap_rcv = vxlan_rcv_process;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
     udp_encap_enable ();
 #endif
+
+    if (ipv4_is_multicast(addr) == true) {
+        if (vxlan_mc_join (sk, addr, mlink) != 0)
+            goto error;
+    }
 
     list_add_tail_rcu(&tnl_socket->node, &vxlan_socket_list);
     atomic_set (&tnl_socket->refcount, 1);
@@ -695,8 +693,8 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
         goto error;
 
     OVS_VXLAN_DEBUG("NEW -> VNI: %d, VTEP: 0x%x:%d, MCAST: 0x%x:%d, NET: %p",
-            mutable->vni, mutable->vtep, mutable->vtep_port,
-            mutable->mcast_ip, mutable->mcast_port,
+            mutable->vni, mutable->vtep, mutable->udp_port,
+            mutable->mcast_ip, mutable->udp_port,
             ovs_dp_get_net(vport->dp));
 
     mutable->tunnel_hlen = VXLAN_HLEN + sizeof (struct iphdr);
@@ -722,8 +720,9 @@ vxlan_set_config (struct vport *vport, struct nlattr *options,
 
     if ((mutable->vtep != old_mutable->vtep) ||
         (mutable->udp_port != old_mutable->udp_port)) {
-        err = vxlan_open_tnl_socket (mutable, mutable->vtep, mutable->udp_port,
-                                   &rcv_socket, &mlink);
+        err = vxlan_open_tnl_socket (mutable, mutable->vtep,
+                                     mutable->udp_port,
+                                     &rcv_socket, &mlink);
         if (err != 0) {
             goto error;
         }
@@ -787,8 +786,8 @@ vxlan_set_options(struct vport *vport, struct nlattr *options)
     ovs_tnl_free_mutable_rtnl (mutable);
 
     OVS_VXLAN_DEBUG ("REAL -> VNI: %d, VTEP: 0x%x:%d, MCAST: 0x%x:%d",
-            mutable->vni, mutable->vtep, mutable->vtep_port,
-            mutable->mcast_ip, mutable->mcast_port);
+            mutable->vni, mutable->vtep, mutable->udp_port,
+            mutable->mcast_ip, mutable->udp_port);
 
 	return 0;
     
@@ -856,15 +855,6 @@ vxlan_update_header(const struct vport *vport,
                     struct sk_buff *skb)
 {
 	struct udphdr    *udph = udp_hdr(skb);
-	struct vxlanhdr  *vxh = (struct vxlanhdr *)(udph + 1);
-
-    vxh->vx_vni = htonl(mutable->vni);
-#if 0
-	if (mutable->flags & TNL_F_OUT_KEY_ACTION) {
-        u32 vni = (u32)(be64_to_cpu(OVS_CB(skb)->tun_id) & 0x00FFFFFF);
-        vxh->vx_vni = htonl(vni);
-    }
-#endif
 
 	udph->source = htons(mutable->udp_port); 
 	udph->dest = htons(OVS_CB(skb)->vxlan_udp_port);
@@ -882,6 +872,50 @@ vxlan_update_header(const struct vport *vport,
 	return skb;
 }
 
+/*
+ * Clones and sends the packet for which there is no FDB entry.
+ * The whole reason for the existence of this function is to have
+ * dynamic learning happen even when there is no mulitcast address
+ * configured. 
+ *
+ * Obviously, this is not the right way to do things. This is a 
+ * temporary band aid till a better solution is found.
+ */
+static inline bool
+vxlan_vxmesh_clone_send (struct vport *vport,
+                         struct tnl_mutable_config  *mutable,
+                         struct sk_buff *skb)
+{
+    int                         i;
+    bool                        vxmesh_sent = false;
+
+    for (i = 0; i < VXLAN_PEER_TABLE_SIZE; i++) {
+        struct vxlan_peer_entry  *pe;
+        struct hlist_node        *node;
+        struct hlist_head        *hbucket;
+        u32                       hash, hk = mutable->vni;
+
+        hash = jhash (&hk, sizeof(32), 0);
+        hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
+        hlist_for_each_entry_rcu(pe, node, hbucket, hash_node){
+            if (pe->vni == mutable->vni) {
+                struct sk_buff *skb_cloned = skb_clone (skb, GFP_ATOMIC);
+                if (skb_cloned) {
+                    OVS_CB(skb_cloned)->tun_ipv4_dst = pe->peer_vtep;
+                    OVS_CB(skb_cloned)->vxlan_udp_port = mutable->udp_port;
+                    ovs_tnl_send (vport, skb_cloned);
+                    vxmesh_sent = true;
+                }
+                else {
+                    OVS_VXLAN_DEBUG("FAILED TO CLONE");
+                }
+            }
+        }
+    }
+
+    return (vxmesh_sent == true) ? true : false;
+}
+
 static int
 vxlan_send(struct vport *vport, struct sk_buff *skb)
 {
@@ -890,8 +924,6 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
     struct vxlan_mac_entry     *vme;
     struct tnl_mutable_config  *mutable;
     struct tnl_vport           *vxport;
-    int                         i;
-    bool                        vxmesh_sent = false;
 
 	vxport    = tnl_vport_priv(vport);
     mutable   = rtnl_dereference(vxport->mutable);
@@ -918,31 +950,7 @@ vxlan_send(struct vport *vport, struct sk_buff *skb)
         return ovs_tnl_send (vport, skb);
     }
 
-    for (i = 0; i < VXLAN_PEER_TABLE_SIZE; i++) {
-        struct vxlan_peer_entry  *pe;
-        struct hlist_node        *node;
-        struct hlist_head        *hbucket;
-        u32                       hash, hk = mutable->vni;
-
-        hash = jhash (&hk, sizeof(32), 0);
-        hbucket = &vxlan_peer_table [(hash & (VXLAN_PEER_TABLE_SIZE - 1))];
-        hlist_for_each_entry_rcu(pe, node, hbucket, hash_node){
-            if (pe->vni == mutable->vni) {
-                struct sk_buff *skb_cloned = skb_clone (skb, GFP_ATOMIC);
-                if (skb_cloned) {
-                    OVS_CB(skb_cloned)->tun_ipv4_dst = pe->peer_vtep;
-                    OVS_CB(skb_cloned)->vxlan_udp_port = mutable->udp_port;
-                    ovs_tnl_send (vport, skb_cloned);
-                    vxmesh_sent = true;
-                }
-                else {
-                    OVS_VXLAN_DEBUG("FAILED TO CLONE");
-                }
-            }
-        }
-    }
-
-    if (vxmesh_sent == false)
+    if (vxlan_vxmesh_clone_send (vport, mutable, skb) == false)
         ovs_vport_record_error(vport, VPORT_E_TX_DROPPED);
 
     kfree_skb(skb);
@@ -966,7 +974,7 @@ sec_path_esp(struct sk_buff *skb)
 }
 
 /* Called with rcu_read_lock and BH disabled. */
-static inline int
+static int
 vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 {
     const struct tnl_mutable_config  *m;
@@ -986,15 +994,18 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 	iph = ip_hdr(skb);
 	vxh = vxlan_hdr(skb);
 
-    OVS_VXLAN_DEBUG("vxlan_rcv_process: %s: SRC: 0x%x, DST: 0x%x",
+    vni = ntohl(vxh->vx_vni);
+    OVS_VXLAN_DEBUG("vxlan_rcv_process: %s: SRC: 0x%x, DST: 0x%x, vni: %d",
                     (ipv4_is_multicast(iph->daddr) ? "MCAST" : "NORMAL"),
-                    iph->saddr, iph->daddr);
+                    iph->saddr, iph->daddr, vni);
 
-	if (unlikely(vxh->vx_flags != htonl(VXLAN_FLAGS) ||
-		     vxh->vx_vni & htonl(0xff))) {
+	if (unlikely((vxh->vx_flags != htonl(VXLAN_FLAGS)) ||
+                 (vni & 0xFF000000))) {
+        pr_warn ("Bad vxlan header: vx_flags: 0x%x:0x%x, vni=0x%x",
+                 vxh->vx_flags, htonl(VXLAN_FLAGS),
+                 vni);
 		goto error;
     }
-    vni = ntohl(vxh->vx_vni) >> 8;
 
     memset (&key, 0, sizeof(struct port_lookup_key));
     key.in_key = cpu_to_be64(vni);
@@ -1005,6 +1016,7 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 
     vport = ovs_tnl_port_table_lookup (&key, &m);
 	if (unlikely(vport == NULL)) {
+        pr_warn ("Failed to find port: %p", vport);
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
 	}
@@ -1020,7 +1032,7 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 
     vme = vxlan_vme_get(vni, eh->h_source);
 
-    if (unlikely(!vme)) {
+    if (unlikely(vme == NULL)) {
         /* New Entry. Learn the entry. */
         vxlan_vme_add (vni, iph->saddr, eh->h_source);
     }
@@ -1046,23 +1058,9 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 
     return 0;
 
-error:
-    ovs_vport_record_error(vport, VPORT_E_RX_DROPPED);
+ error:
 	kfree_skb(skb);
 	return 0;
-}
-
-/* Called with rcu_read_lock and BH disabled. */
-static int
-vxlan_rcv(struct sock *sk, struct sk_buff *skb)
-{
-    return vxlan_rcv_process (sk, skb);
-}
-
-static int
-vxlan_mcast_rcv(struct sock *sk, struct sk_buff *skb)
-{
-    return vxlan_rcv_process (sk, skb);
 }
 
 /* Must be called with rcu_read_lock */
