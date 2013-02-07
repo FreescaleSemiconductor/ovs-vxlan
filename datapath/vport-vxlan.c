@@ -1007,6 +1007,7 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 		goto error;
     }
 
+    vni = vni >> 8;
     memset (&key, 0, sizeof(struct port_lookup_key));
     key.in_key = cpu_to_be64(vni);
     key.tunnel_type = (TNL_T_PROTO_VXLAN | TNL_T_KEY_EXACT);
@@ -1016,7 +1017,6 @@ vxlan_rcv_process (struct sock *sk, struct sk_buff *skb)
 
     vport = ovs_tnl_port_table_lookup (&key, &m);
 	if (unlikely(vport == NULL)) {
-        pr_warn ("Failed to find port: %p", vport);
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
 	}
