@@ -985,7 +985,7 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
 
     SMAP_FOR_EACH (node, args) {
         bool flags_cfg = parse_tunnel_config_flags(name, node, &flags, 
-                                     options, supports_csum);
+                                                   options, supports_csum);
         if (flags_cfg == true) {
             continue;
         }
@@ -998,9 +998,9 @@ parse_vxlan_tunnel_config(const char *name, const char *type,
                 vtep = in_addr.s_addr;
         } else if (strcmp(node->key, "vni") == 0) {
             vni = strtoull(node->value, NULL, 0);
-            if (vni > 0xFFFFFF) {
-                VLOG_WARN("bad VNI. Can't be more than "
-                        "16777215(0xFFFFFF). %llu", (uint64_t)vni);
+            if (vni <= 0 || vni > 0xFFFFFF) {
+                VLOG_WARN("bad VNI: %llu. VNI need to be between "
+                        "1 - 16777215(0xFFFFFF)", (uint64_t)vni);
                 return EINVAL;
             } 
         } else if (strcmp(node->key, "udp_port") == 0) {
